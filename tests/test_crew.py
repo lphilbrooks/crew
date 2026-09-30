@@ -54,6 +54,21 @@ class Sandbox(unittest.TestCase):
         self.env.pop("CODEX_HOME", None)
 
     def tearDown(self):
+        # Tasks started without --wait may still be running in the repo. Let them finish, or
+        # Windows refuses to delete folders they're using.
+        import shutil
+        import time
+        deadline = time.time() + 60
+        for task in (self.home / "runs").glob("*") if (self.home / "runs").exists() else []:
+            while not (task / "result.json").exists() and time.time() < deadline:
+                time.sleep(0.5)
+        time.sleep(1)
+        for _ in range(20):
+            try:
+                shutil.rmtree(self.tmp.name)
+                break
+            except OSError:
+                time.sleep(0.5)
         self.tmp.cleanup()
 
     def crew(self, *args, mode="ok", **extra_env):

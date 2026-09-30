@@ -1,10 +1,11 @@
 ---
 name: crew
 description: >-
-  Hand a bounded task (code review, second opinion, implementation, web research, summarising)
-  to a different vendor's coding-agent CLI: OpenAI Codex (`codex`), Anthropic Claude Code
-  (`claude`) or Google Antigravity (`agy`). Works from any of them, so Claude can ask Codex for a
-  review and Codex can ask Claude. Each task gets its own permission scope (file access, web,
+  Split work across coding agents from other vendors: break a request into pieces (code review,
+  second opinions, implementation, web research, summarising) and send them, several at once if
+  they're independent, to OpenAI Codex (`codex`), Anthropic Claude Code (`claude`) or Google
+  Antigravity (`agy`), then check and combine the results. Works from any of them, so Claude can
+  ask Codex for a review and Codex can ask Claude. Each task gets its own permission scope (file access, web,
   network) and every run is recorded on disk. Use only when the user explicitly asks to involve
   another agent, e.g. "/crew", "have codex review this", "get claude's opinion on this", "ask
   gemini to look this up", "delegate this to codex".
@@ -19,9 +20,11 @@ metadata:
 
 # crew
 
-crew runs another vendor's agent on one task, with a permission scope you choose, and returns its
-answer. You keep ownership of the plan, the judgment and every commit. Only use crew when the user
-asks for it.
+crew lets you act as a team lead. Split the user's request into pieces where that helps, send each
+piece to an agent from another vendor with a permission scope you choose (independent pieces in
+parallel), then check the answers, follow up where needed, and combine the results. Each
+`crew.py run` is one piece. You keep ownership of the plan, the judgment and every commit. Only
+use crew when the user asks for it.
 
 The script is `scripts/crew.py` in this skill's folder (Python 3.9+). Run it with `python3`, or
 `python` on Windows. Below, `crew.py` means its full path.

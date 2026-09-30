@@ -1,16 +1,20 @@
 # crew
 
-Let your coding agent hand work to another company's coding agent.
+Turn your coding agent into a team lead that can hand work to agents from other companies.
 
 ## TL;DR
 
-- **What:** a skill for Claude Code, Codex and other agents that read `SKILL.md` skills. It sends
-  one task at a time to **Codex**, **Claude Code** or **Gemini (via Antigravity)** and brings back
-  the answer.
-- **Why:** a second model family catches different bugs, and you get more out of the
-  subscriptions you already pay for.
+- **What:** a skill for Claude Code, Codex and other agents that read `SKILL.md` skills. Your
+  agent breaks a request into pieces and farms them out, often several at once, to **Codex**,
+  **Claude Code** or **Gemini (via Antigravity)**. It then checks what comes back, sends
+  follow-ups where needed, and pulls it all together.
+- **Why:** you get more done in parallel, a different model family catches different bugs, and
+  you make use of the subscriptions you already pay for.
+- **Nothing hidden:** each agent opens in its own terminal tab showing the exact prompt it was
+  sent and its output as it works. The prompt and the answer are saved as Markdown, so you can
+  review what every agent was asked and what it said.
 - **Safe by default:** every task gets its own permission scope (read, verify or write; web on or
-  off; network on or off). Delegated agents never commit. Every run is logged.
+  off; network on or off). Delegated agents never commit.
 - **Install:** copy `skills/crew` into your agent's skills folder and run `crew.py doctor`.
 - **Use:** ask in plain words, e.g. *"/crew have codex review my changes"*.
 
@@ -50,8 +54,9 @@ the results.
 
 ## How it works
 
-crew is one Python script (`skills/crew/scripts/crew.py`, standard library only). Your agent runs
-it as a normal shell command.
+crew is one Python script (`skills/crew/scripts/crew.py`, standard library only). Your agent stays
+in charge: it decides how to split your request, then calls crew once for each piece. Pieces that
+don't depend on each other run at the same time, each as its own agent. For each piece:
 
 1. **Pick an agent.** Each role (review, check, implement, research…) lists agents in order of
    preference. crew skips the vendor you're calling from, so from Claude Code a review goes to
@@ -68,17 +73,38 @@ it as a normal shell command.
    there isn't one. It snapshots `git status` before and after, so any file the agent changed
    without permission is reported.
 4. **Report back.** Your agent gets a status, the list of changed files and the delegated agent's
-   answer. It checks the answer, and does any committing itself.
+   answer.
 
-Everything lands in a run folder, `~/.crew/runs/<time>-<role>-<name>/`:
-- `task.md`: exactly what was sent;
-- `cmd.json`: the exact command;
-- `raw.log`: what the tab showed;
-- `final.md`: the answer;
-- `result.json`: status, time, tokens, cost and changed files.
+When the pieces are back, your agent checks each one, sends follow-ups where something is wrong or
+thin (continuing the same session, or as a new task), and combines the results. It does any
+committing itself.
 
 A delegated agent can't start crew tasks of its own, and your agent's session details aren't
 passed on to it.
+
+## Traceable by design
+
+When agents hand work to other agents, it's easy to lose track of who was asked what. crew is
+built so that a person can follow every step.
+
+- **You can watch it happen.** Each agent opens in its own terminal tab. The tab shows the exact
+  prompt that was sent, the permissions it has, and its output as it works. Tabs stay open until
+  you close them.
+- **Everything is saved.** Each run gets a folder, `~/.crew/runs/<time>-<role>-<name>/`:
+
+  | File | Holds |
+  |---|---|
+  | `task.md` | the exact prompt sent, in Markdown |
+  | `final.md` | the agent's answer, in Markdown |
+  | `raw.log` | everything the tab showed |
+  | `cmd.json` | the exact command, model and permissions |
+  | `result.json` | status, time, tokens, cost and any changed files |
+
+- **Easy to review across agents.** Prompts and answers sit side by side as readable Markdown, so
+  you can check one agent's work against another's, or see why your agent made a decision.
+  `crew.py status` lists recent runs, and `crew.py stats` shows usage per model.
+
+Run folders are never deleted automatically. Remove old ones whenever you like.
 
 ## Install
 
