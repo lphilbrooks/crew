@@ -1,74 +1,60 @@
-# Writing a task for a delegated agent
+# Writing a task
 
-The delegated agent starts from nothing. It never saw your conversation, and it only knows:
+The delegated agent hasn't seen your conversation. It knows only:
 
-1. the text crew sends: a scope block that crew writes, the role's own text if the config has
-   any, then your task;
-2. files it can read in the working directory (`--cd`);
-3. the instruction files its own CLI loads: codex reads `AGENTS.md`, claude reads `CLAUDE.md`.
-   Anything that lives only in the other one, or only in your head, must go in the task.
+1. the text crew sends: crew's scope note, any role text, then your task;
+2. the files it can read in `--cd`;
+3. its own instruction file: Codex reads `AGENTS.md`, Claude reads `CLAUDE.md`.
 
-So a good task can be understood by a capable engineer who just walked in. It names things
-concretely: file paths, function names, commands, versions, URLs.
+Anything else has to be in the task. Write it for a capable engineer who just walked in: name
+the files, functions, commands, versions and URLs.
 
-## A template
+## Template
 
-Plain Markdown headings work with every backend. Leave out a section that doesn't apply.
+Drop any section you don't need.
 
 ```markdown
 ## Goal
-One or two sentences: what should be true when this is finished.
+What should be true when this is done, in one or two sentences.
 
 ## Context
-What exists now and why this is needed. Paths, names, the error message, the relevant
-decision already made. Say which files to change and which to leave alone.
+What exists now and why this matters. Paths, names, the error message, decisions already made.
+Which files to change and which to leave alone.
 
 ## Constraints
-Only the rules that matter for this task: no new dependencies, keep the public API, match
-the existing error-handling style, target Python 3.9, ...
+Only the rules that matter here: no new dependencies, keep the public API, target Python 3.9...
 
 ## Done when
-The exact commands that must pass, e.g. `pytest tests/parser -q` and `ruff check src/`.
+The exact commands that must pass, e.g. `pytest tests/parser -q`.
 
 ## Report
-What to put in the final answer and in what shape (see below).
+What the answer should contain, and in what shape.
 ```
 
-crew's scope block already says what the agent may touch (read / verify / write, web, network)
-and that it must not commit. Don't repeat it; add only the task-specific limits.
+crew already tells the agent its access level and not to commit. Add only the limits specific to
+this task.
 
-## Fit the task to the role
+## By role
 
-**review / check.** Ask for evidence with every finding: `file:line`, plus the command and output
-that shows the problem, since these roles can run tests. Ask it to mark anything it could not
-confirm as unverified. Name what matters most ("focus on concurrency in `worker.py`") so a long
-diff doesn't get a shallow pass.
+- **review / check:** ask for `file:line` and the command output behind each finding. Ask it to
+  mark anything it couldn't confirm. Say what to focus on, so a large diff gets a proper look.
+- **implement:** say which files it may change. Give the project's real check commands, not "run
+  the tests". Ask for a report of files changed, commands run with pass/fail counts, and open
+  questions.
+- **research:** number the questions and say what shape the answer should take. Ask for a source
+  per claim, and the date or version it applies to.
+- **light:** say exactly what to produce, e.g. "a summary under 200 words". If it shouldn't
+  explore, say "use only the files named here".
 
-**implement.** Name the files it may change. Give the real check commands from the project's
-README, CI config or `AGENTS.md`/`CLAUDE.md`, never "run the tests". Say what "done" means in
-behaviour, not effort. Ask for a report of files changed, commands run with pass/fail counts, and
-open questions.
+## Common mistakes
 
-**research.** List the questions numbered, and say the answer shape (a table, one line each, a
-short list). Ask for a source URL per claim and the date or version the answer applies to. If
-recency matters, say "as of today".
-
-**light.** Say exactly what to produce (a summary under 200 words, a list of functions with
-one-line descriptions). If it should not explore, say "use only the files named here".
-
-## Things that make delegated tasks fail
-
-- **Pointing at the conversation.** "Fix the bug we discussed" means nothing to the agent. Paste
-  the error, name the file.
-- **Several jobs in one task.** One task should produce one result you can check on its own.
-  Dispatch the rest separately, in parallel if they're independent.
-- **Overlapping parallel writes.** Two `write` tasks in the same repository must touch different
-  files, and each task must say which.
-- **A wrong starting assumption.** You can't talk to the agent while it runs. If you realise the
-  task was based on something false, stop it (close its tab or kill the process), look at what
-  it already changed, and dispatch a corrected task.
-- **Tool-free work without saying so.** For pure reasoning (critique this plan, compare these
-  options) write "answer from the text above; don't read files or run commands", otherwise
-  coding agents go exploring.
-- **Secrets.** Never put tokens, passwords or personal data in a task. It is saved under
-  `~/.crew/runs/` and sent to the vendor.
+- **Referring to the conversation.** "Fix the bug we discussed" means nothing to the agent. Paste
+  the error and name the file.
+- **Several jobs in one task.** Split them, and run them in parallel if they're independent.
+- **Parallel writes to the same files.** Give each `write` task its own files, and say which.
+- **A wrong assumption.** You can't talk to the agent mid-run. Stop it, look at what it changed,
+  and send a corrected task.
+- **Unwanted exploring.** For pure reasoning, say "answer from the text above; don't read files or
+  run commands".
+- **Secrets.** Never include tokens, passwords or personal data. They'd be saved in the run
+  folder and sent to the vendor.
