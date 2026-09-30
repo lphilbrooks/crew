@@ -1,0 +1,81 @@
+{
+  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed.",
+
+  "view": "auto",
+  "hold": true,
+  "max_minutes": 60,
+  "terminal": null,
+
+  "backends": {
+    "codex": {
+      "exe": null,
+      "ignore_user_config": false
+    },
+    "claude": {
+      "exe": null
+    },
+    "agy": {
+      "exe": null,
+      "settings": "~/.gemini/antigravity-cli/settings.json"
+    }
+  },
+
+  "agents": {
+    "codex-strong": "codex:gpt-6.1-sol@high",
+    "codex-balanced": "codex:gpt-6.1-sol@medium",
+    "codex-fast": "codex:gpt-6-luna@medium",
+    "codex-frontier": "codex:gpt-6-astra@high",
+    "claude-strong": "claude:opus@high",
+    "claude-balanced": "claude:sonnet@high",
+    "claude-fast": "claude:haiku",
+    "claude-frontier": "claude:fable@high",
+    "google-fast": "agy:gemini-3.8-flash-medium",
+    "google-strong": "agy:gemini-3.1-pro-high"
+  },
+
+  "roles": {
+    "review": {
+      "agent": ["codex-strong", "claude-strong"],
+      "mode": "review",
+      "access": "verify",
+      "web": false,
+      "network": false,
+      "about": "Code review of a diff (--target uncommitted | commit:<sha> | base:<branch>). Can build and run tests; repository changes are flagged."
+    },
+    "check": {
+      "agent": ["codex-strong", "claude-strong"],
+      "access": "verify",
+      "web": false,
+      "network": false,
+      "about": "Second opinion on a plan, claim, design or specific code. Can build and run tests to back its findings."
+    },
+    "implement": {
+      "agent": ["codex-balanced", "claude-balanced"],
+      "access": "write",
+      "web": false,
+      "network": false,
+      "about": "Bounded implementation. Edits the working tree, never commits; the caller checks the result and commits."
+    },
+    "implement-light": {
+      "agent": ["codex-fast", "claude-fast"],
+      "access": "write",
+      "web": false,
+      "network": false,
+      "about": "Cheap mechanical work: boilerplate, fixtures, test scaffolding, docs from code."
+    },
+    "research": {
+      "agent": ["google-fast", "codex-fast", "claude-fast"],
+      "access": "read",
+      "web": true,
+      "network": false,
+      "about": "Web research and documentation lookups. Answers with sources."
+    },
+    "light": {
+      "agent": ["google-fast", "codex-fast", "claude-fast"],
+      "access": "read",
+      "web": false,
+      "network": false,
+      "about": "Light read-only work: summarise files or logs, draft prose, simple lookups."
+    }
+  }
+}
