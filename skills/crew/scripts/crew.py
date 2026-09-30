@@ -636,15 +636,21 @@ def launch_hidden(argv: list, cwd: Path) -> None:
 
 
 def launch_wmi(argv: list, cwd: Path) -> bool:
+    """A WMI-created process does not inherit this process's environment, so it is passed
+    explicitly (on stdin, not the command line, so secrets never appear in process listings)."""
     ps = shutil.which("pwsh") or shutil.which("powershell")
     if not ps:
         return False
     cmdline = subprocess.list2cmdline(argv).replace("'", "''")
-    script = ("$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0}; "
+    script = ("$vars = [string[]]([Console]::In.ReadToEnd() | ConvertFrom-Json); "
+              "$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly "
+              "-Property @{ShowWindow=[uint16]0; EnvironmentVariables=$vars}; "
               f"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{cmdline}'; "
               f"CurrentDirectory='{str(cwd).replace(chr(39), chr(39) * 2)}'; ProcessStartupInformation=$si}}; exit $r.ReturnValue")
+    env_list = json.dumps([f"{k}={v}" for k, v in os.environ.items()])
     try:
-        r = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, timeout=60)
+        r = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", script],
+                           input=env_list.encode("utf-8"), capture_output=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0

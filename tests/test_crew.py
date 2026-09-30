@@ -119,6 +119,28 @@ class TestSpecs(unittest.TestCase):
             crew.enforcement("agy", {"access": "verify", "web": False, "network": False}, True, False)
 
 
+@unittest.skipUnless(os.name == "nt", "WMI fallback is Windows-only")
+class TestWmiLaunch(unittest.TestCase):
+    def test_environment_reaches_wmi_launched_process(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "env.txt"
+            os.environ["CREW_WMI_PROBE"] = "probe ö"
+            try:
+                ok = crew.launch_wmi([sys.executable, "-c",
+                                      f"import os; open(r'{out}', 'w', encoding='utf-8')"
+                                      f".write(os.environ.get('CREW_WMI_PROBE', 'MISSING'))"], Path(tmp))
+            finally:
+                del os.environ["CREW_WMI_PROBE"]
+            if not ok:
+                self.skipTest("WMI process creation unavailable here")
+            for _ in range(60):
+                if out.exists() and out.read_text(encoding="utf-8"):
+                    break
+                time.sleep(0.5)
+            self.assertEqual(out.read_text(encoding="utf-8"), "probe ö")
+
+
 class TestGitState(Sandbox):
     def test_detects_edit_to_already_dirty_file_from_subdir(self):
         top = crew.git_top(self.repo / "sub")
