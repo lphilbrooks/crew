@@ -12,8 +12,10 @@ Standard library only, Python 3.9+. Start with `crew.py doctor`.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -23,6 +25,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -1281,6 +1286,285 @@ def cmd_setup_agy_web(args) -> int:
     print(f"crew: added {AGY_FETCH_RULE} to permissions.allow in {path}")
     print("crew: agy may now read any web page without asking. Remove the rule to undo.")
     return 0
+
+
+# ---------------------------------------------------------------- fact check
+
+CHECK_UA = "crew-factcheck/1.1"
+CHECK_GET_LIMIT = 64 * 1024
+REGISTRIES = {
+    "crates": "https://crates.io/api/v1/crates/{name}",
+    "pypi": "https://pypi.org/pypi/{name}/json",
+    "npm": "https://registry.npmjs.org/{name}",
+}
+REGISTRY_ENV = {"crates": "CREW_REGISTRY_CRATES", "pypi": "CREW_REGISTRY_PYPI", "npm": "CREW_REGISTRY_NPM"}
+URL_RE = re.compile(r"https?://[^\s<>\[\]\"'`]+", re.IGNORECASE)
+URL_TRAIL = ".,;:'\">*"
+PKG_NAME = r"[A-Za-z][A-Za-z0-9_.-]{1,60}"
+PKG_VERSION = r"\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.]+)?(?:\+[0-9A-Za-z.]+)?"
+# Stops "1.2.3.4" being read as "1.2.3" and "2.0-beta" being cut short.
+VERSION_END = r"(?![\w.+-]*\w)"
+INLINE_CLAIM_RES = [
+    re.compile(rf"(?<![\w./@-])({PKG_NAME})@v?({PKG_VERSION}){VERSION_END}"),  # name@1.2.3
+    re.compile(rf"`({PKG_NAME})`\s+v?({PKG_VERSION}){VERSION_END}"),  # `name` 1.2.3
+    re.compile(rf"(?<![\w./@-])({PKG_NAME})\s+v({PKG_VERSION}){VERSION_END}"),  # name v1.2.3
+    re.compile(rf"(?<![\w./@-])({PKG_NAME})\s+({PKG_VERSION}){VERSION_END}"),  # name 1.2.3
+]
+# Common English words and table headers that look like "word 1.2" but are not packages.
+SKIP_NAMES = {
+    "the", "and", "of", "is", "was", "in", "to", "a", "an", "for", "on", "or", "by", "as", "it",
+    "version", "versions", "release", "releases", "latest", "python", "rust", "node", "step", "phase",
+    "section", "table", "figure", "fig", "page", "chapter", "edition", "crate", "crates", "package",
+    "packages", "name", "library", "libraries", "dependency", "dependencies", "date", "updated",
+    "published",
+}
+
+
+def _clean_url(url: str) -> str:
+    url = url.rstrip(URL_TRAIL)
+    # Drop a closing bracket only when it is unbalanced: "[x](url)" ends with one, Wikipedia URLs don't.
+    while url.endswith(")") and url.count(")") > url.count("("):
+        url = url[:-1].rstrip(URL_TRAIL)
+    return url
+
+
+def extract_urls(text: str) -> list:
+    """http(s) URLs from Markdown links and bare text, first-seen order, no duplicates."""
+    seen = {}
+    for match in URL_RE.finditer(text):
+        url = _clean_url(match.group(0))
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError:
+            continue
+        if parts.scheme in ("http", "https") and parts.hostname:
+            seen[url] = None
+    return list(seen)
+
+
+def url_allowed(url: str) -> bool:
+    """False for local and private addresses. No DNS lookup: names are trusted to be public."""
+    if os.environ.get("CREW_CHECK_ALLOW_LOCAL") == "1":
+        return True
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if not host or host == "localhost" or host.endswith((".local", ".internal")):
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_reserved
+                or addr.is_unspecified)
+
+
+def _probe(url: str, method: str, timeout: float):
+    """(status, final_url). HTTP error statuses are returned, not raised."""
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": CHECK_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if method == "GET":
+                resp.read(CHECK_GET_LIMIT)
+            return resp.status, resp.geturl()
+    except urllib.error.HTTPError as e:
+        return e.code, e.geturl()
+
+
+def check_url(url: str, timeout: float = 10.0) -> dict:
+    """HEAD first, GET if HEAD is refused or fails. Never raises."""
+    result = {"url": url, "status": None, "final_url": None, "ok": False, "error": None}
+    try:
+        try:
+            status, final = _probe(url, "HEAD", timeout)
+        except (OSError, ValueError):
+            status = None
+        if status is None or status in (403, 405, 501):
+            status, final = _probe(url, "GET", timeout)
+        result.update(status=status, final_url=final, ok=200 <= status < 400)
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
+def _skipped(url: str, reason: str) -> dict:
+    return {"url": url, "status": None, "final_url": None, "ok": None, "error": reason}
+
+
+def check_urls(urls: list, limit: int = 30, workers: int = 8) -> list:
+    """Check the first `limit` allowed URLs concurrently. Results keep input order."""
+    urls = list(urls)
+    allowed = [u for u in urls if url_allowed(u)][:limit]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        checked = dict(zip(allowed, pool.map(check_url, allowed)))
+    out = []
+    for url in urls:
+        if url in checked:
+            out.append(checked[url])
+        elif not url_allowed(url):
+            out.append(_skipped(url, "skipped: private or local address"))
+        else:
+            out.append(_skipped(url, f"skipped: over limit of {limit}"))
+    return out
+
+
+def detect_ecosystems(text: str) -> list:
+    low = text.lower()
+    found = []
+    if re.search(r"crates\.io|\bcrates?\b|\bcargo\b|cargo\.toml", low):
+        found.append("crates")
+    if re.search(r"pypi|pip3? install", low):
+        found.append("pypi")
+    if re.search(r"\bnpm|package\.json", low):
+        found.append("npm")
+    return found
+
+
+def _plain(cell: str) -> str:
+    cell = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cell)  # keep link text, drop the URL
+    return cell.replace("`", "").replace("*", "").strip()
+
+
+def _table_claim(line: str):
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 2 or all(re.fullmatch(r":?-+:?", c) for c in cells):
+        return None
+    name = _plain(cells[0]).rstrip(".-")
+    if not re.fullmatch(PKG_NAME, name):
+        return None
+    for cell in cells[1:]:
+        version = _plain(cell)
+        if re.fullmatch(PKG_VERSION, version):
+            return name, version
+    return None
+
+
+def _inline_claims(line: str) -> list:
+    hits = []
+    for pattern in INLINE_CLAIM_RES:
+        for m in pattern.finditer(line):
+            hits.append((m.start(), m.group(1).rstrip(".-"), m.group(2)))
+    return [(name, version) for _, name, version in sorted(hits)]
+
+
+def _looks_like_date(version: str) -> bool:
+    return re.fullmatch(r"(19|20)\d\d\.\d{1,2}(\.\d{1,2})?", version) is not None
+
+
+def extract_version_claims(text: str) -> list:
+    """(name, version) pairs from table rows and inline mentions, first-seen order."""
+    claims = {}
+    for line in text.splitlines():
+        if line.lstrip().startswith("|"):
+            hit = _table_claim(line)
+            pairs = [hit] if hit else []
+        else:
+            pairs = _inline_claims(line)
+        for name, version in pairs:
+            if name.lower() in SKIP_NAMES or len(name) < 2 or _looks_like_date(version):
+                continue
+            claims[(name, version)] = None
+    return list(claims)
+
+
+def registry_url(ecosystem: str, name: str) -> str:
+    template = os.environ.get(REGISTRY_ENV[ecosystem]) or REGISTRIES[ecosystem]
+    return template.replace("{name}", urllib.parse.quote(name, safe=""))
+
+
+def _registry_facts(ecosystem: str, data: dict):
+    """(set of published non-yanked versions, latest stable version or None)."""
+    if ecosystem == "crates":
+        crate = data.get("crate") or {}
+        published = {v["num"] for v in data.get("versions", []) if not v.get("yanked")}
+        return published, crate.get("max_stable_version") or crate.get("max_version")
+    if ecosystem == "pypi":
+        releases = data.get("releases") or {}
+        published = {v for v, files in releases.items() if files and not all(f.get("yanked") for f in files)}
+        return published, (data.get("info") or {}).get("version")
+    published = set(data.get("versions") or {})
+    return published, (data.get("dist-tags") or {}).get("latest")
+
+
+def check_package(ecosystem: str, name: str, claimed: str, timeout: float = 10.0) -> dict:
+    """Look a package version up in its registry. Never raises."""
+    result = {"ecosystem": ecosystem, "name": name, "claimed": claimed,
+              "found": None, "exists": None, "latest": None, "error": None}
+    try:
+        req = urllib.request.Request(registry_url(ecosystem, name),
+                                     headers={"User-Agent": CHECK_UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        published, latest = _registry_facts(ecosystem, data)
+        result.update(found=True, exists=claimed in published, latest=latest)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            result["found"] = False
+        else:
+            result["error"] = f"HTTP {e.code}"
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
+def check_packages(text: str, task_text: str = "", limit: int = 25) -> list:
+    """Check version claims against the ecosystems the text is about. Keeps only found packages."""
+    ecosystems = detect_ecosystems(task_text + "\n" + text)
+    kept = []
+    for name, version in extract_version_claims(text)[:limit]:
+        for ecosystem in ecosystems:
+            result = check_package(ecosystem, name, version)
+            if result["found"] is True:
+                kept.append(result)
+                break
+    return kept
+
+
+def _read_optional(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
+def fact_check(task: Path) -> dict:
+    """Check a finished task's URLs and package versions. Writes task/checks.json; never raises."""
+    try:
+        task = Path(task)
+        final = _read_optional(task / "final.md")
+        task_text = _read_optional(task / "task.md")
+        cmd = read_json(task / "cmd.json") if (task / "cmd.json").is_file() else {}
+        urls = check_urls(extract_urls(final))
+        packages = check_packages(final, task_text)
+        full = {"checked_at": now_iso(), "role": cmd.get("role"), "scope": cmd.get("scope"),
+                "urls": urls, "packages": packages}
+        write_json(task / "checks.json", full)
+        checked = [u for u in urls if u["ok"] is not None]
+        failed = [{"url": u["url"], "status": u["status"], "error": u["error"]} for u in checked if not u["ok"]]
+        # "latest" questions matter even when the claimed version exists, so keep those too.
+        flagged = [p for p in packages if p["exists"] is False or (p["latest"] and p["latest"] != p["claimed"])]
+        return {"urls_checked": len(checked), "urls_failed": failed, "packages": flagged,
+                "checked_at": full["checked_at"]}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def summarize_checks(summary: dict) -> list:
+    """Short terminal lines for a fact_check summary."""
+    if summary.get("error"):
+        return [f"fact check failed: {summary['error']}"]
+    lines = []
+    for bad in summary.get("urls_failed", []):
+        why = str(bad["status"]) if bad.get("status") else short(bad.get("error") or "no response", 60)
+        lines.append(f"URL failed ({why}): {bad['url']}")
+    for pkg in summary.get("packages", []):
+        if pkg.get("exists") is False:
+            tail = f" (latest {pkg['latest']})" if pkg.get("latest") else ""
+            lines.append(f"{pkg['name']}: claimed {pkg['claimed']} is not a published version{tail}")
+        elif pkg.get("latest"):
+            lines.append(f"{pkg['name']}: claimed {pkg['claimed']} exists, but latest is {pkg['latest']}")
+    if not lines:
+        ok = summary.get("urls_checked", 0) - len(summary.get("urls_failed", []))
+        lines.append(f"fact check: {ok} URLs ok, no version problems")
+    return lines
 
 
 # ------------------------------------------------------------------- runner
