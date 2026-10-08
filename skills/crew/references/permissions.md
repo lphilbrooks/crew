@@ -4,7 +4,7 @@ Every task has three scope settings: `--access`, `--web` and `--network`. crew m
 each backend's own controls, records how each one is enforced (`cmd.json` → `enforcement`), and
 refuses a scope the backend can't honour.
 
-Contents: [the table](#how-each-setting-is-enforced) · [git check](#the-git-check) ·
+Contents: [the table](#how-each-setting-is-enforced) · [git check](#the-git-check) · [fact check](#the-fact-check) ·
 [scratch folder](#scratch-folder) · [isolation](#isolation) ·
 [sandboxed callers](#calling-crew-from-a-sandbox) · [Codex](#codex) · [Claude](#claude) ·
 [agy](#agy)
@@ -54,6 +54,18 @@ example, `"CARGO_TARGET_DIR": "{scratch}/target"` keeps a Rust build out of the 
   or `CODEX_HOME` are kept.
 - A delegated Claude runs without MCP servers or skills. With `--restricted` (recent versions),
   it also ignores your personal Claude settings.
+
+## The fact check
+
+After a task with `--web`, crew itself (not the agent) requests every URL the answer cites, and
+looks up claimed package versions on crates.io, PyPI and npm. These requests come from your
+machine.
+- Only tasks that already had web access are checked, and that agent could have fetched the same
+  URLs itself, so the check gives a task no new way out.
+- Addresses on your own network are never requested: loopback, private and link-local
+  addresses, names that resolve to them, and redirects that lead to them are all refused.
+- At most 30 URLs per answer, each with a 10-second timeout and a capped read.
+- Turn it off with `"fact_check": false` in `~/.crew/config.json`.
 
 ## Calling crew from a sandbox
 

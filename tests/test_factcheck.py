@@ -273,5 +273,89 @@ class TestFactCheck(FactCheckBase):
                          ["fact check: 12 URLs ok, no version problems"])
 
 
+
+
+class TestReviewFindings(unittest.TestCase):
+    """Regression tests for problems found in review of the fact checker."""
+
+    def setUp(self):
+        self.saved_env = os.environ.pop("CREW_CHECK_ALLOW_LOCAL", None)
+
+    def tearDown(self):
+        if self.saved_env is not None:
+            os.environ["CREW_CHECK_ALLOW_LOCAL"] = self.saved_env
+
+    def test_other_spellings_of_local_addresses_are_refused(self):
+        for host in ("2130706433", "0x7f000001", "127.1", "0177.0.0.1", "0", "[::ffff:127.0.0.1]",
+                     "169.254.169.254", "192.168.1.93", "printer.localhost"):
+            self.assertFalse(crew.url_allowed(f"http://{host}/x"), host)
+
+    def test_names_resolving_to_private_addresses_are_refused(self):
+        real = crew.socket.getaddrinfo
+        crew.socket.getaddrinfo = lambda host, *a, **k: [(2, 1, 6, "", ("127.0.0.1", 80))]
+        try:
+            self.assertFalse(crew.url_allowed("http://looks-public.example/"))
+        finally:
+            crew.socket.getaddrinfo = real
+
+    def test_redirect_to_private_address_is_not_followed(self):
+        import http.server
+        import threading
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                hits.append(self.path)
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header("Location", "/secret")
+                else:
+                    self.send_response(200)
+                self.end_headers()
+            do_GET = do_HEAD
+
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        real = crew.url_allowed
+        crew.url_allowed = lambda url: url.endswith("/start")  # pretend the first hop is a public host
+        try:
+            result = crew.check_url(f"http://127.0.0.1:{server.server_port}/start", timeout=5)
+        finally:
+            crew.url_allowed = real
+            server.shutdown()
+        self.assertNotIn("/secret", hits)
+        self.assertFalse(result["ok"])
+
+    def test_blocked_sites_and_passing_mentions_are_not_failures(self):
+        saved = crew.check_urls, crew.check_packages
+        crew.check_urls = lambda urls: [
+            {"url": "https://a.example/", "status": 200, "final_url": None, "ok": True, "error": None},
+            {"url": "https://b.example/", "status": 403, "final_url": None, "ok": None,
+             "error": "blocked by the site (HTTP 403)"}]
+
+        def pkg(claimed, exists=True):
+            return {"ecosystem": "crates", "name": "clap", "claimed": claimed, "found": True,
+                    "exists": exists, "latest": "4.6.7", "error": None}
+        # the answer gives the latest version and mentions an older one in passing
+        crew.check_packages = lambda text, task_text="": [pkg("4.6.7"), pkg("4.5.31")]
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / "final.md").write_text("x", encoding="utf-8")
+                summary = crew.fact_check(Path(d))
+        finally:
+            crew.check_urls, crew.check_packages = saved
+        self.assertEqual(summary["urls_failed"], [])
+        self.assertEqual(summary["urls_blocked"], 1)
+        self.assertEqual(summary["packages"], [])
+        self.assertIn("could not be checked", " ".join(crew.summarize_checks(summary)))
+
+    def test_versions_compare_numerically(self):
+        self.assertEqual(crew.version_key("2.0"), crew.version_key("2.0.0"))
+        self.assertEqual(crew.version_key("v1.2.3+build5"), crew.version_key("1.2.3"))
+        self.assertNotEqual(crew.version_key("1.2.3-rc1"), crew.version_key("1.2.3"))
+
+
 if __name__ == "__main__":
     unittest.main()

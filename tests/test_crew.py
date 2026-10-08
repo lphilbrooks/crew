@@ -638,3 +638,24 @@ class TestSpreading(Sandbox):
                             "--task", "x", "--wait", FAKE_ANSWER="see https://example.invalid/x")
         self.assertEqual(rc, 0, out)
         self.assertIsNone(self.result(out)["checks"])
+
+    def test_model_override_stays_with_its_backend_on_retry(self):
+        self.set_role("pair", ["codex:m1", "claude:m2"])
+        rc, out = self.crew("run", "--role", "pair", "--model", "codex-only-model", "--cd", str(self.repo),
+                            "--task", "x", "--wait", FAKE_LIMITED="codex")
+        self.assertEqual(rc, 0, out)
+        cmd = self.cmd(out)
+        self.assertEqual((cmd["backend"], cmd["model"]), ("claude", "m2"))
+
+    def test_model_override_refused_for_panels(self):
+        self.set_role("trio", ["codex:m1", "claude:m3"])
+        rc, out = self.crew("run", "--role", "trio", "--panel", "--model", "x", "--cd", str(self.repo), "--task", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("can't apply to a panel", out)
+
+    def test_bad_quota_file_does_not_break_dispatch(self):
+        (self.home / "quota.json").write_text(json.dumps(
+            {"codex": {"windows": {"w": {"used": "lots", "resets_at": "soon"}}, "limited_until": "later"}}))
+        self.set_role("pair", ["codex:m1", "claude:m2"], balance=True)
+        rc, out = self.crew("run", "--role", "pair", "--cd", str(self.repo), "--task", "x", "--wait")
+        self.assertEqual(rc, 0, out)

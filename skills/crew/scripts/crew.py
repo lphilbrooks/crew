@@ -1763,6 +1763,7 @@ def url_allowed(url: str) -> bool:
 class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not url_allowed(newurl):
+            fp.close()
             raise urllib.error.URLError(f"redirect to a private or local address refused: {newurl}")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -1772,7 +1773,9 @@ _CHECK_OPENER = urllib.request.build_opener(_CheckedRedirects)
 
 def _probe(url: str, method: str, timeout: float):
     """(status, final_url). HTTP error statuses are returned, not raised."""
-    req = urllib.request.Request(url, method=method, headers={"User-Agent": CHECK_UA})
+    # Some sites (crates.io among them) answer 404 unless the client accepts HTML.
+    req = urllib.request.Request(url, method=method, headers={
+        "User-Agent": CHECK_UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
     try:
         with _CHECK_OPENER.open(req, timeout=timeout) as resp:
             if method == "GET":
@@ -1793,6 +1796,8 @@ def check_url(url: str, timeout: float = 10.0) -> dict:
         if status is None or status in (403, 405, 501):
             status, final = _probe(url, "GET", timeout)
         result.update(status=status, final_url=final, ok=200 <= status < 400)
+        if status in (401, 403, 429):  # the site refuses automated requests: unknown, not dead
+            result.update(ok=None, error=f"blocked by the site (HTTP {status})")
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
     return result
@@ -1964,11 +1969,15 @@ def fact_check(task: Path) -> dict:
         write_json(task / "checks.json", full)
         checked = [u for u in urls if u["ok"] is not None]
         failed = [{"url": u["url"], "status": u["status"], "error": u["error"]} for u in checked if not u["ok"]]
-        # "latest" questions matter even when the claimed version exists, so keep those too.
+        blocked = sum(1 for u in urls if (u["error"] or "").startswith("blocked"))
+        # "latest" questions matter even when the claimed version exists, so keep those too, unless
+        # the answer also gives the latest version (then the older one is mentioned in passing).
+        current = {p["name"] for p in packages if p["latest"] and version_key(p["latest"]) == version_key(p["claimed"])}
         flagged = [p for p in packages if p["exists"] is False
-                   or (p["latest"] and version_key(p["latest"]) != version_key(p["claimed"]))]
-        return {"urls_checked": len(checked), "urls_failed": failed, "packages": flagged,
-                "checked_at": full["checked_at"]}
+                   or (p["latest"] and p["name"] not in current
+                       and version_key(p["latest"]) != version_key(p["claimed"]))]
+        return {"urls_checked": len(checked), "urls_failed": failed, "urls_blocked": blocked,
+                "packages": flagged, "checked_at": full["checked_at"]}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -2001,6 +2010,8 @@ def summarize_checks(summary: dict) -> list:
     if not lines:
         ok = summary.get("urls_checked", 0) - len(summary.get("urls_failed", []))
         lines.append(f"fact check: {ok} URLs ok, no version problems")
+    if summary.get("urls_blocked"):
+        lines.append(f"{summary['urls_blocked']} URL(s) could not be checked: the site refuses automated requests")
     return lines
 
 
