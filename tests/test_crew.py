@@ -449,7 +449,9 @@ class TestClaude(Sandbox):
         self.assertEqual(rc, 0, out)
         cmd = self.cmd(out)
         self.assertEqual(self.arg_after(cmd["argv"], "--resume"), "11111111-1111-1111-1111-111111111111")
-        self.assertEqual(cmd["resumed_from"], str(first))
+        # crew stores the resolved path: /var is /private/var on macOS, and Windows temp paths
+        # can arrive as 8.3 short names
+        self.assertEqual(Path(cmd["resumed_from"]).resolve(), first.resolve())
         self.assertEqual(cmd["caller_session"], "caller-session-1")
         r = self.result(out)
         self.assertAlmostEqual(r["session_cost_usd"], 0.0246)

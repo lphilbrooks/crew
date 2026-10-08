@@ -17,6 +17,14 @@ CREW = ROOT / "skills" / "crew" / "scripts" / "crew.py"
 sys.path.insert(0, str(CREW.parent))
 import crew  # noqa: E402
 
+
+def temp_dir():
+    """TemporaryDirectory that tolerates Windows file locks; ignore_cleanup_errors is Python 3.10+."""
+    try:
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    except TypeError:
+        return tempfile.TemporaryDirectory()
+
 CRATES = {
     "bsa": {"crate": {"max_stable_version": "0.2.1", "max_version": "0.2.1"},
             "versions": [{"num": "0.2.1", "yanked": False}, {"num": "0.1.1", "yanked": False}]},
@@ -227,7 +235,7 @@ class TestPackages(FactCheckBase):
 
 class TestFactCheck(FactCheckBase):
     def test_fact_check_end_to_end(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with temp_dir() as tmp:
             task = Path(tmp)
             (task / "final.md").write_text(
                 "Summary.\n\n"
@@ -256,7 +264,7 @@ class TestFactCheck(FactCheckBase):
             self.assertEqual(written["role"], "research")
 
     def test_fact_check_missing_folder_returns_error(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with temp_dir() as tmp:
             summary = crew.fact_check(Path(tmp) / "missing")
             self.assertIn("error", summary)
 

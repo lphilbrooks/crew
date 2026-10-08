@@ -15,11 +15,19 @@ sys.path.insert(0, str(ROOT / "skills" / "crew" / "scripts"))
 import crew  # noqa: E402
 
 
+def temp_dir():
+    """TemporaryDirectory that tolerates Windows file locks; ignore_cleanup_errors is Python 3.10+."""
+    try:
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    except TypeError:
+        return tempfile.TemporaryDirectory()
+
+
 
 
 class Routing(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = temp_dir()
         self.cfg = {"agents": {}}
         self.saved_file = crew.QUOTA_FILE
         self.saved_cmd = crew.backend_cmd
@@ -190,7 +198,7 @@ class TestCodexWindows(unittest.TestCase):
         return f
 
     def test_nested_rate_limits_last_wins(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with temp_dir() as tmp:
             base = Path(tmp) / "sessions"
             old = {"type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
                 "primary": {"used_percent": 1.0, "window_minutes": 300, "resets_at": 1}}}}
@@ -203,7 +211,7 @@ class TestCodexWindows(unittest.TestCase):
                 "seven_day": {"used": 0.27, "resets_at": 1791962803}})
 
     def test_finds_session_in_older_day(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with temp_dir() as tmp:
             base = Path(tmp) / "sessions"
             line = json.dumps({"rate_limits": {"primary": {"used_percent": 50.0, "window_minutes": 45}}})
             self.make_tree(base, [line], day="2026/09/01")
@@ -212,7 +220,7 @@ class TestCodexWindows(unittest.TestCase):
                              {"45_min": {"used": 0.5, "resets_at": None}})
 
     def test_missing_returns_none(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        with temp_dir() as tmp:
             base = Path(tmp) / "sessions"
             self.assertIsNone(crew.codex_quota_windows(self.SID, sessions_dir=base))
             self.make_tree(base, [json.dumps({"type": "event_msg"})])
