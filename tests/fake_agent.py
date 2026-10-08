@@ -31,7 +31,7 @@ if kind == "codex" and mode == "limited":
 
 if kind == "claude" and mode == "limited":
     print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
-                      "result": "Claude AI usage limit reached|4102444800", "session_id": "l"}))
+                      "result": f"Claude AI usage limit reached|{int(time.time()) + 7200}", "session_id": "l"}))
     sys.exit(1)
 
 if kind == "codex":

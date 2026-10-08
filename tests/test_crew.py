@@ -575,8 +575,9 @@ class TestSpreading(Sandbox):
         r = self.result(out)
         self.assertEqual(r["status"], "limited")
         self.assertIn("not retried", r["note"])
-        # the claude limit text carries its reset time, which crew keeps
-        self.assertEqual(self.quota()["claude"]["limited_until"], 4102444800)
+        # the claude limit text carries its reset time (two hours ahead here), which crew keeps
+        import time
+        self.assertAlmostEqual(self.quota()["claude"]["limited_until"], time.time() + 7200, delta=120)
 
     def test_limited_backend_is_avoided_next_time(self):
         self.set_role("pair", ["codex:m1", "claude:m2"])

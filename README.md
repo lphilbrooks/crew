@@ -59,8 +59,15 @@ in charge: it decides how to split your request, then calls crew once for each p
 don't depend on each other run at the same time, each as its own agent. For each piece:
 
 1. **Pick an agent.** Each role (review, check, implement, research…) lists agents in order of
-   preference. crew skips the vendor you're calling from, so from Claude Code a review goes to
-   Codex, and from Codex it goes to Claude.
+   preference. crew skips your own model family, so from Claude Code a review goes to Codex, and
+   from Codex it goes to Claude. It goes by the model, not the CLI: agy can run Claude and GPT
+   models too, and `agy:claude-opus-5-5-high` doesn't count as a second opinion for Claude.
+   crew also remembers each vendor's usage limits (Claude and Codex report them as they run):
+   - a vendor at its limit is skipped until the limit resets;
+   - if an agent hits its limit mid-task, crew sends the task on to the next agent in the role
+     and links the two runs;
+   - roles marked `balance` (by default `implement-light` and `light`) prefer whichever vendor
+     has used least of its current limit. `crew.py quota` shows what crew knows.
 2. **Set the scope.** The role gives defaults and your agent can override them per task:
    - **access:** `read`, `verify` (may build and run tests) or `write`;
    - **web:** on or off;
@@ -100,6 +107,8 @@ built so that a person can follow every step.
   | `cmd.json` | the exact command, model, permissions, and the session that sent the task |
   | `result.json` | status, time, tokens, cost, the model that actually ran, and any changed files |
   | `events.jsonl` | the full event stream, for Codex and Claude |
+  | `request.md` | the task as your agent wrote it, before crew's scope note (used for retries) |
+  | `checks.json` | for web tasks: every cited URL and package version crew checked, and the result |
 
 - **Easy to review across agents.** Prompts and answers sit side by side as readable Markdown, so
   you can check one agent's work against another's, or see why your agent made a decision.
@@ -111,6 +120,11 @@ built so that a person can follow every step.
   older versions lag a release, so each run records `resolved_model`. Tools such as web search
   run on a helper model; `model_usage` lists every model a run used and what each cost. A
   follow-up's `cost_usd` covers that follow-up only (the session total is `session_cost_usd`).
+
+- **Facts checked for free.** After a task with web access, crew fetches each URL the answer
+  cites and looks up every package version it claims on crates.io, PyPI or npm. Dead links and
+  versions that don't exist (or aren't the latest) are listed with the answer. This uses no
+  model, only plain web requests. Turn it off with `"fact_check": false`.
 
 Run folders are never deleted automatically. Remove old ones whenever you like.
 
@@ -171,7 +185,9 @@ crew.py run --role check --task-file plan.md --wait          # second opinion
 crew.py run --role implement --task-file todo.md --network --wait
 crew.py run --resume <run folder> --task "Use the helper in util.py instead" --wait
 crew.py run --role research --task "Latest stable <library> version, with sources" --wait
-crew.py status | stats | collect <run folder> | roles | models | doctor
+crew.py run --role research --panel --task "..." --wait     # same question to two model families
+crew.py check <run folder>                                  # re-run the fact check
+crew.py status | stats | quota | collect <run folder> | roles | models | doctor
 ```
 
 Useful flags:
@@ -182,7 +198,8 @@ Useful flags:
 | `--web` / `--no-web` | allow or block web search |
 | `--network` / `--no-network` | allow or block network for commands |
 | `--agent <spec>` | use a specific agent, e.g. `codex:gpt-6.1-sol@high` |
-| `--caller codex\|claude\|agy` | say who's calling, so crew skips that vendor |
+| `--caller codex\|claude\|agy` | say who's calling, so crew skips that model family |
+| `--panel [N]` | send the task to N agents (default 2) from different model families, to compare |
 
 ## How strictly scopes are enforced
 
@@ -234,6 +251,9 @@ Other settings:
 | `view` | `auto`, `tab` or `hidden` terminal |
 | `hold` | keep tabs open after a task finishes |
 | `max_minutes` | kill runaway tasks (default 60) |
+| `fact_check` | check cited URLs and package versions after web tasks (default on) |
+| `roles.<name>.balance` | prefer the vendor with the most usage left (on for `implement-light`, `light`) |
+| `limit_cooldown_minutes` | how long to avoid a vendor that hit its limit without saying when it resets (60) |
 | `terminal` | use your own terminal, e.g. `["kitty", "@", "launch", "{argv}"]` |
 | `backends.<name>.exe` | point to a CLI that isn't on PATH |
 

@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -78,7 +79,7 @@ def read_json(path):
 def write_json(path, data) -> None:
     """Write atomically so a reader never sees a half-written file."""
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     for attempt in range(50):
         try:
@@ -354,8 +355,23 @@ def _save_quota(quota: dict) -> None:
         pass
 
 
+def _num(value):
+    """A float from a JSON value, or None for anything that isn't a number."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def record_quota(backend: str, windows: dict, source: str) -> None:
     """Replace a backend's usage windows, keeping any limit already recorded for it."""
+    # A window without a reset time would otherwise count forever, and a backend that is never
+    # chosen is never refreshed; give it an hour.
+    later = time.time() + 3600
+    windows = {str(name): {"used": _num(w.get("used")) or 0.0, "resets_at": _num(w.get("resets_at")) or later}
+               for name, w in (windows or {}).items() if isinstance(w, dict)}
     quota = read_quota()
     entry = _quota_entry(quota, backend)
     entry.setdefault("limited_until", None)
@@ -367,7 +383,8 @@ def record_quota(backend: str, windows: dict, source: str) -> None:
 def record_limit(backend: str, resets_at=None, cooldown_minutes: float = 60) -> None:
     """The backend hit its limit: blocked until the reset time if known, else for a cooldown."""
     now = time.time()
-    until = resets_at if resets_at and resets_at > now else now + cooldown_minutes * 60
+    resets_at = _num(resets_at)
+    until = resets_at if resets_at and now < resets_at < now + 31 * 86400 else now + cooldown_minutes * 60
     quota = read_quota()
     entry = _quota_entry(quota, backend)
     entry.setdefault("windows", {})
@@ -384,13 +401,16 @@ def quota_score(entry, now=None):
     now = time.time() if now is None else now
     windows = entry.get("windows")
     windows = windows if isinstance(windows, dict) else {}
-    limited = entry.get("limited_until")
+    limited = _num(entry.get("limited_until"))
     if not windows and limited is None:
         return None
     scores = [0.0]  # a window whose reset time has passed no longer counts
     for w in windows.values():
-        if isinstance(w, dict) and (w.get("resets_at") is None or w["resets_at"] > now):
-            scores.append(float(w.get("used") or 0))
+        if not isinstance(w, dict):
+            continue
+        resets = _num(w.get("resets_at"))
+        if resets is None or resets > now:
+            scores.append(_num(w.get("used")) or 0.0)
     if limited is not None and limited > now:
         scores.append(1.0)
     return max(scores)
@@ -409,12 +429,12 @@ def claude_quota_windows(event: dict):
     info = info if isinstance(info, dict) else {}
     unified = info.get("unifiedWindows")
     unified = unified if isinstance(unified, dict) else {}
-    windows = {name: {"used": float(w.get("utilization") or 0), "resets_at": w.get("resetsAt")}
-               for name, w in unified.items() if isinstance(w, dict)}
+    windows = {name: {"used": _num(w.get("utilization")) or 0.0, "resets_at": _num(w.get("resetsAt"))}
+               for name, w in unified.items() if isinstance(w, dict) and _num(w.get("utilization")) is not None}
     if windows:
         return windows
     if info.get("status", "allowed") != "allowed":
-        return {"limit": {"used": 1.0, "resets_at": info.get("resetsAt")}}
+        return {"limit": {"used": 1.0, "resets_at": _num(info.get("resetsAt"))}}
     return None
 
 
@@ -466,13 +486,14 @@ def codex_quota_windows(session_id: str, sessions_dir=None):
                     continue
                 windows = {}
                 for w in (rl or {}).values():
-                    if isinstance(w, dict) and w.get("used_percent") is not None:
+                    used = _num(w.get("used_percent")) if isinstance(w, dict) else None
+                    if used is not None:
                         name = CODEX_WINDOW_NAMES.get(w.get("window_minutes"), f"{w.get('window_minutes')}_min")
-                        windows[name] = {"used": float(w["used_percent"]) / 100, "resets_at": w.get("resets_at")}
+                        windows[name] = {"used": used / 100, "resets_at": _num(w.get("resets_at"))}
                 if windows:
                     found = windows
         return found
-    except (OSError, ValueError):
+    except Exception:  # an unexpected log format must never fail the run it describes
         return None
 
 
@@ -482,8 +503,11 @@ def looks_rate_limited(text: str) -> bool:
 
 def limit_reset_from_text(text: str):
     """Epoch reset time from text such as 'usage limit reached|1791458400', else None."""
-    m = re.search(r"\|\s*(\d{10})\b", text or "")
-    return float(m[1]) if m else None
+    m = re.search(r"limit[^|\n]{0,80}\|\s*(\d{10})\b", text or "", re.I)
+    if not m:
+        return None
+    when = float(m[1])
+    return when if time.time() < when < time.time() + 31 * 86400 else None
 
 
 # --------------------------------------------------------------------- scope
@@ -1123,6 +1147,8 @@ def cmd_run(args) -> int:
              "network": role_cfg.get("network", False) if args.network is None else args.network}
     request = {key: getattr(args, key, None) for key in REQUEST_KEYS}
     request.update(cd=str(cwd), caller=caller, excluded=excluded)
+    if args.panel and args.model:
+        raise CrewError("--model names one backend's model, so it can't apply to a panel; use set-role or --agent")
 
     if args.agent:  # an explicit choice is always honoured, so it is never retried elsewhere
         options = [choose_agent(cfg, args.agent, caller, explicit=True)]
@@ -1135,6 +1161,9 @@ def cmd_run(args) -> int:
     if args.panel:
         return run_panel(cfg, args, role_cfg, options, cwd, scope, text, caller, request)
     spec, exe, note = options[0]
+    if retry_of and args.model and spec["backend"] != req.get("model_backend"):
+        args.model = None  # that model name belongs to the backend that hit its limit
+    request.update(model=args.model, model_backend=spec["backend"] if args.model else None)
     request["retry"] = not args.agent and len(options) > 1
     task = launch_task(cfg, args, args.role, role_cfg, spec, exe, cwd, scope, text, caller, note,
                        extra={"request": request, "retry_of": str(retry_of) if retry_of else None})
@@ -1645,6 +1674,7 @@ def cmd_setup_agy_web(args) -> int:
 
 CHECK_UA = "crew-factcheck/1.1"
 CHECK_GET_LIMIT = 64 * 1024
+REGISTRY_READ_LIMIT = 16 * 1024 * 1024
 REGISTRIES = {
     "crates": "https://crates.io/api/v1/crates/{name}",
     "pypi": "https://pypi.org/pypi/{name}/json",
@@ -1695,29 +1725,56 @@ def extract_urls(text: str) -> list:
     return list(seen)
 
 
+def _public_ip(text: str) -> bool:
+    addr = ipaddress.ip_address(text)
+    if getattr(addr, "ipv4_mapped", None):
+        addr = addr.ipv4_mapped
+    return not (addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_reserved
+                or addr.is_unspecified or addr.is_multicast)
+
+
 def url_allowed(url: str) -> bool:
-    """False for local and private addresses. No DNS lookup: names are trusted to be public."""
+    """False for local and private addresses, including names that resolve to them. The answer
+    being checked is model output, so a cited URL must not reach the user's own network."""
     if os.environ.get("CREW_CHECK_ALLOW_LOCAL") == "1":
         return True
     try:
-        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower().rstrip(".")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError:
         return False
-    if not host or host == "localhost" or host.endswith((".local", ".internal")):
+    if parts.scheme not in ("http", "https") or not host or host == "localhost" \
+            or host.endswith((".local", ".internal", ".localhost")):
         return False
     try:
-        addr = ipaddress.ip_address(host)
+        return _public_ip(host)
     except ValueError:
-        return True
-    return not (addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_reserved
-                or addr.is_unspecified)
+        pass
+    if re.fullmatch(r"[0-9a-fx.]+", host) and not re.search(r"[g-wyz]", host):
+        return False  # 2130706433, 0x7f000001, 127.1: other spellings of an IP address
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return True  # unresolvable: the fetch fails and is reported as a dead link
+    return all(_public_ip(info[4][0].split("%")[0]) for info in infos)
+
+
+class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not url_allowed(newurl):
+            raise urllib.error.URLError(f"redirect to a private or local address refused: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_CHECK_OPENER = urllib.request.build_opener(_CheckedRedirects)
 
 
 def _probe(url: str, method: str, timeout: float):
     """(status, final_url). HTTP error statuses are returned, not raised."""
     req = urllib.request.Request(url, method=method, headers={"User-Agent": CHECK_UA})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _CHECK_OPENER.open(req, timeout=timeout) as resp:
             if method == "GET":
                 resp.read(CHECK_GET_LIMIT)
             return resp.status, resp.geturl()
@@ -1840,17 +1897,28 @@ def _registry_facts(ecosystem: str, data: dict):
     return published, (data.get("dist-tags") or {}).get("latest")
 
 
-def check_package(ecosystem: str, name: str, claimed: str, timeout: float = 10.0) -> dict:
+def version_key(version: str):
+    """Comparable form of a version: 2.0 and 2.0.0 are the same; build metadata is ignored."""
+    main, _, pre = str(version).strip().lstrip("vV").split("+")[0].partition("-")
+    nums = (main.split(".") + ["0", "0", "0"])[:max(3, len(main.split(".")))]
+    return tuple(int(n) if n.isdigit() else n for n in nums), pre
+
+
+def check_package(ecosystem: str, name: str, claimed: str, timeout: float = 8.0) -> dict:
     """Look a package version up in its registry. Never raises."""
     result = {"ecosystem": ecosystem, "name": name, "claimed": claimed,
               "found": None, "exists": None, "latest": None, "error": None}
+    # npm's abbreviated document is a fraction of the full one, which can run to megabytes.
+    accept = "application/vnd.npm.install-v1+json" if ecosystem == "npm" else "application/json"
     try:
-        req = urllib.request.Request(registry_url(ecosystem, name),
-                                     headers={"User-Agent": CHECK_UA, "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        published, latest = _registry_facts(ecosystem, data)
-        result.update(found=True, exists=claimed in published, latest=latest)
+        req = urllib.request.Request(registry_url(ecosystem, name), headers={"User-Agent": CHECK_UA, "Accept": accept})
+        with _CHECK_OPENER.open(req, timeout=timeout) as resp:
+            body = resp.read(REGISTRY_READ_LIMIT + 1)
+        if len(body) > REGISTRY_READ_LIMIT:
+            raise ValueError(f"registry answer larger than {REGISTRY_READ_LIMIT} bytes")
+        published, latest = _registry_facts(ecosystem, json.loads(body.decode("utf-8")))
+        result.update(found=True, exists=version_key(claimed) in {version_key(v) for v in published},
+                      latest=latest)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             result["found"] = False
@@ -1864,14 +1932,18 @@ def check_package(ecosystem: str, name: str, claimed: str, timeout: float = 10.0
 def check_packages(text: str, task_text: str = "", limit: int = 25) -> list:
     """Check version claims against the ecosystems the text is about. Keeps only found packages."""
     ecosystems = detect_ecosystems(task_text + "\n" + text)
-    kept = []
-    for name, version in extract_version_claims(text)[:limit]:
+    claims = extract_version_claims(text)[:limit]
+    if not ecosystems or not claims:
+        return []
+
+    def first_found(claim):
         for ecosystem in ecosystems:
-            result = check_package(ecosystem, name, version)
+            result = check_package(ecosystem, *claim)
             if result["found"] is True:
-                kept.append(result)
-                break
-    return kept
+                return result
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        return [r for r in pool.map(first_found, claims) if r]
 
 
 def _read_optional(path: Path) -> str:
@@ -1893,11 +1965,15 @@ def fact_check(task: Path) -> dict:
         checked = [u for u in urls if u["ok"] is not None]
         failed = [{"url": u["url"], "status": u["status"], "error": u["error"]} for u in checked if not u["ok"]]
         # "latest" questions matter even when the claimed version exists, so keep those too.
-        flagged = [p for p in packages if p["exists"] is False or (p["latest"] and p["latest"] != p["claimed"])]
+        flagged = [p for p in packages if p["exists"] is False
+                   or (p["latest"] and version_key(p["latest"]) != version_key(p["claimed"]))]
         return {"urls_checked": len(checked), "urls_failed": failed, "packages": flagged,
                 "checked_at": full["checked_at"]}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+SEARCH_REDIRECT = "vertexaisearch.cloud.google.com/grounding-api-redirect/"
 
 
 def summarize_checks(summary: dict) -> list:
@@ -1905,7 +1981,15 @@ def summarize_checks(summary: dict) -> list:
     if summary.get("error"):
         return [f"fact check failed: {summary['error']}"]
     lines = []
-    for bad in summary.get("urls_failed", []):
+    failed = summary.get("urls_failed", [])
+    # Gemini cites its search tool's short-lived redirect links rather than the pages themselves.
+    redirects = [b for b in failed if SEARCH_REDIRECT in b["url"]]
+    if redirects:
+        lines.append(f"{len(redirects)} cited link(s) are expired Google search redirects, not real sources: "
+                     "ask for the page URLs if the claims matter")
+    for bad in failed:
+        if bad in redirects:
+            continue
         why = str(bad["status"]) if bad.get("status") else short(bad.get("error") or "no response", 60)
         lines.append(f"URL failed ({why}): {bad['url']}")
     for pkg in summary.get("packages", []):
@@ -2232,6 +2316,45 @@ SESSION_VAR_RE = re.compile(
     r"|CODEX_(SESSION_ID|THREAD_ID|CI|SANDBOX\w*|VERSION))$")
 
 
+def after_run(task: Path, cmd: dict, view, status: str, note):
+    """crew's own steps once the agent has finished: record quota, handle a usage limit (and
+    retry elsewhere), fact-check web answers. A failure here is noted, never fatal to the run."""
+    backend = cmd["backend"]
+    quota = retried_as = checks = None
+    try:
+        quota = view.quota
+        if backend == "codex" and view.session:
+            quota = codex_quota_windows(view.session)
+        if quota:
+            record_quota(backend, quota, f"{backend} run {task.name}")
+        tail = "\n".join([view.error or ""] + view.text[-30:])
+        hit_limit = any((_num((w or {}).get("used")) or 0) >= 1 for w in (quota or {}).values())
+        if status in ("agent-error", "empty") and (looks_rate_limited(tail) or hit_limit):
+            status = "limited"
+            resets = limit_reset_from_text(tail) or max(
+                [_num(w.get("resets_at")) for w in (quota or {}).values()
+                 if (_num((w or {}).get("used")) or 0) >= 1 and _num(w.get("resets_at"))], default=None)
+            record_limit(backend, resets, load_config().get("limit_cooldown_minutes", 60))
+            note = f"{backend} hit its usage limit" + (f" (resets {dt.datetime.fromtimestamp(resets):%H:%M %d %b})"
+                                                       if resets else "") + (f": {note}" if note else "")
+            req = cmd.get("request") or {}
+            if req.get("retry"):
+                retried_as, retry_note = retry_elsewhere(task)
+                note += f"; {retry_note}"
+                view.show(f"crew: {retry_note}", "yellow")
+            elif req and not req.get("agent") and not cmd.get("panel"):
+                note += "; not retried: no other eligible agent for this role"
+    except Exception as e:
+        note = f"{note}; " if note else ""
+        note += f"crew could not record usage limits: {type(e).__name__}: {e}"
+    if status == "ok" and cmd.get("fact_check"):
+        view.show("crew: fact-checking the cited URLs and package versions...", "dim")
+        checks = fact_check(task)
+        for line in summarize_checks(checks):
+            view.show(f"  {line}", "yellow" if "fail" in line or "not" in line or "latest is" in line else "dim")
+    return status, note, quota, retried_as, checks
+
+
 def retry_elsewhere(task: Path):
     """Send a task whose agent hit its usage limit to the next eligible agent, as a new run.
     Returns (new run folder or None, note)."""
@@ -2326,37 +2449,7 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         note = (f"{len(violations)} file(s) changed outside what access={cmd['scope']['access']} allows. "
                 "If you edited the repo yourself during the run, those edits are included.")
 
-    backend = cmd["backend"]
-    quota = view.quota
-    if backend == "codex" and view.session:
-        quota = codex_quota_windows(view.session)
-    if quota:
-        record_quota(backend, quota, f"{backend} run {task.name}")
-    retried_as = None
-    tail = "\n".join([view.error or ""] + view.text[-30:])
-    hit_limit = any((w or {}).get("used", 0) >= 1 for w in (quota or {}).values())
-    if status in ("agent-error", "empty") and (looks_rate_limited(tail) or hit_limit):
-        status = "limited"
-        resets = limit_reset_from_text(tail) or max(
-            [w["resets_at"] for w in (quota or {}).values() if (w or {}).get("used", 0) >= 1 and w.get("resets_at")],
-            default=None)
-        record_limit(backend, resets, load_config().get("limit_cooldown_minutes", 60))
-        note = f"{backend} hit its usage limit" + (f" (resets {dt.datetime.fromtimestamp(resets):%H:%M %d %b})"
-                                                   if resets else "") + (f": {note}" if note else "")
-        req = cmd.get("request") or {}
-        if req.get("retry"):
-            retried_as, retry_note = retry_elsewhere(task)
-            note += f"; {retry_note}"
-            view.show(f"crew: {retry_note}", "yellow")
-        elif req and not req.get("agent") and not cmd.get("panel"):
-            note += "; not retried: no other eligible agent for this role"
-
-    checks = None
-    if status == "ok" and cmd.get("fact_check"):
-        view.show("crew: fact-checking the cited URLs and package versions...", "dim")
-        checks = fact_check(task)
-        for line in summarize_checks(checks):
-            view.show(f"  {line}", "yellow" if "fail" in line or "not" in line or "latest is" in line else "dim")
+    status, note, quota, retried_as, checks = after_run(task, cmd, view, status, note)
     seconds = round(time.time() - started, 1)
     session_cost = view.cost
     cost = session_cost

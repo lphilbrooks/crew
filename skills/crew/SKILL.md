@@ -15,7 +15,7 @@ compatibility: >-
   signed in, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # crew
@@ -87,6 +87,16 @@ Other options:
 | `--no-hold` | close the tab when the task finishes |
 | `--slug` | name the run folder |
 | `--max-minutes` | kill the agent after this long |
+| `--panel [N]` | send the task to N agents (default 2) from different model families at once |
+
+**Panels.** For research where being wrong is costly, `--panel` asks agents from two model
+families the same question. Their mistakes rarely overlap, so read where they disagree and check
+those claims yourself before using them. `crew.py collect <panel folder>` reprints all answers.
+
+**Usage limits.** crew skips a vendor that is at its usage limit, and if an agent hits its limit
+during a task, the task moves on to the next agent in the role automatically (`--wait` follows
+it). An agent you named with `--agent` is never swapped. `crew.py quota` shows each vendor's
+last known usage.
 
 ### Waiting for results
 
@@ -98,6 +108,8 @@ Independent tasks can run in parallel. Parallel `write` tasks in one repository 
 different files, and each task must say which.
 
 `--wait` prints the status, the scope, any violations or changed files, and the agent's answer.
+After a task with web access, it also lists any cited URL that failed and any package version
+the registries don't confirm: check those before relying on the answer.
 If the model that ran differs from the one asked for, it says so (`ran <model>`): Claude Code
 resolves short names itself and can lag a release. The fast roles use Claude Haiku 5.5 at
 `medium` effort; pass `--effort high` for knowledge-heavy research.
@@ -114,6 +126,7 @@ It exits 0 for ok, 2 for any other status, 3 if the wait timed out and 1 for usa
 | `scope-violation` | repository files changed that the access level forbids; your own edits during the run count too |
 | `timeout` | killed at `--max-minutes` |
 | `harness-error` | crew's runner failed or was closed |
+| `limited` | the vendor's usage limit was hit; `note` says whether it was sent on to another agent |
 
 ## Follow-ups
 

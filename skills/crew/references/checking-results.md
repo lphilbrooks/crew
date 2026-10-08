@@ -15,6 +15,7 @@ anything.
 | `scope-violation` | See below before doing anything else. |
 | `timeout` | Look at what it changed, then split the task or allow more time. |
 | `harness-error` | crew's runner failed or its window was closed. Rerun. |
+| `limited` | The vendor's usage limit was hit. If `note` says it was retried, use the linked run; otherwise wait or pick another agent. |
 
 **Scope violations.** `violations` lists repository files that changed during a `read` or
 `verify` task. Your own edits during the run are included, so remove those from the list first.
@@ -41,6 +42,14 @@ Then check each remaining file and revert only those. Never reset the whole tree
    Then check the new result the same way.
 7. **Commit it yourself** once the checks pass and the diff looks right. Until then the working
    tree is the only copy of the work, so don't reset, checkout, stash or clean it.
+
+## After a research task
+
+- Read crew's fact check first. A failed URL or an unconfirmed package version means that claim
+  needs checking before you use it.
+- A clean fact check only shows that the links load and the versions exist. It doesn't show that
+  a page says what the answer claims, so open the source for anything that matters.
+- For a panel, compare the answers. Where they disagree, settle it from a primary source.
 
 ## After a review or check task
 

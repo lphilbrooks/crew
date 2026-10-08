@@ -233,8 +233,25 @@ class TestLimitText(unittest.TestCase):
             self.assertFalse(crew.looks_rate_limited(text), text)
 
     def test_reset_from_text(self):
-        self.assertEqual(crew.limit_reset_from_text("Claude AI usage limit reached|1791458400"), 1791458400.0)
+        soon = int(time.time()) + 7200
+        self.assertEqual(crew.limit_reset_from_text(f"Claude AI usage limit reached|{soon}"), float(soon))
         self.assertIsNone(crew.limit_reset_from_text("usage limit reached"))
+        # implausible times (past, or decades ahead) and pipes far from any limit message are ignored
+        self.assertIsNone(crew.limit_reset_from_text("usage limit reached|1000000000"))
+        self.assertIsNone(crew.limit_reset_from_text("usage limit reached|9999999999"))
+        self.assertIsNone(crew.limit_reset_from_text(f"table | {soon}"))
+
+    def test_bad_values_never_raise(self):
+        self.assertIsNone(crew.claude_quota_windows(
+            {"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {"five_hour": {"utilization": "25%"}}}}))
+        self.assertEqual(crew.quota_score({"windows": {"w": {"used": "x", "resets_at": "soon"}}}), 0.0)
+        self.assertIsNone(crew.quota_score({"windows": {}, "limited_until": "later"}))
+
+    def test_window_without_reset_expires(self):
+        crew.record_quota("claude", {"limit": {"used": 1.0, "resets_at": None}}, "test")
+        entry = crew.read_quota()["claude"]
+        self.assertTrue(crew.quota_exhausted(entry))
+        self.assertFalse(crew.quota_exhausted(entry, now=time.time() + 2 * 3600))
 
 
 if __name__ == "__main__":
