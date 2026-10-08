@@ -10,6 +10,11 @@ Turn your coding agent into a team lead that can hand work to agents from other 
   follow-ups where needed, and pulls it all together.
 - **Why:** you get more done in parallel, a different model family catches different bugs, and
   you make use of the subscriptions you already pay for.
+- **Spreads the load:** crew knows how much of each vendor's usage limit is left. It skips a
+  vendor that's out, moves a task on if its agent hits a limit mid-run, and can send one question
+  to several model families at once so you can compare answers.
+- **Checks facts for free:** after web research, crew loads every cited URL and checks every
+  claimed package version against crates.io, PyPI and npm, without using a model.
 - **Nothing hidden:** each agent opens in its own terminal tab showing the exact prompt it was
   sent and its output as it works. The prompt and the answer are saved as Markdown, so you can
   review what every agent was asked and what it said.
@@ -17,6 +22,21 @@ Turn your coding agent into a team lead that can hand work to agents from other 
   off; network on or off). Delegated agents never commit.
 - **Install:** copy `skills/crew` into your agent's skills folder and run `crew.py doctor`.
 - **Use:** ask in plain words, e.g. *"/crew have codex review my changes"*.
+
+## What it's for
+
+| Job | Role | Goes to, when Claude Code is in charge |
+|---|---|---|
+| Review a diff (uncommitted, a commit, or a branch) | `review` | Codex gpt-6.1-sol, which can build and run tests |
+| Second opinion on a plan, claim or finding | `check` | Codex gpt-6.1-sol |
+| Bounded implementation; it edits files but never commits | `implement` | Codex gpt-6.1-sol |
+| Boilerplate, fixtures, scaffolding | `implement-light` | Codex gpt-6-luna |
+| Web research and version lookups, with sources | `research` | Codex gpt-6-luna, then Gemini Flash |
+| Summaries of files or logs, drafting text | `light` | Gemini Flash |
+
+When Codex is in charge, reviews go to Claude Opus and the light roles to Claude Haiku 5.5.
+Independent pieces run in parallel, and a finished Codex or Claude task can be continued in the
+same session with `--resume`.
 
 ## What it looks like in practice
 
@@ -80,7 +100,8 @@ don't depend on each other run at the same time, each as its own agent. For each
    there isn't one. It snapshots `git status` before and after, so any file the agent changed
    without permission is reported.
 4. **Report back.** Your agent gets a status, the list of changed files and the delegated agent's
-   answer.
+   answer. After a task with web access it also gets crew's fact check: cited URLs that failed,
+   and package versions the registries don't confirm.
 
 When the pieces are back, your agent checks each one, sends follow-ups where something is wrong or
 thin (continuing the same session, or as a new task), and combines the results. It does any
@@ -219,8 +240,8 @@ afterwards. Details: [`permissions.md`](skills/crew/references/permissions.md).
 Models live in config, not code.
 - The defaults are in [`assets/config.default.json`](skills/crew/assets/config.default.json).
 - Your overrides go in `~/.crew/config.json`.
-- An agent is written `backend:model@effort`, e.g. `codex:gpt-6.1-sol@high`, `claude:opus`,
-  `agy:gemini-3.8-flash-medium`.
+- An agent is written `backend:model@effort`, e.g. `codex:gpt-6.1-sol@high`,
+  `claude:claude-opus-5-5@high`, `agy:gemini-3.8-flash-medium`.
 
 | Role | Tries, in order | Default scope |
 |---|---|---|
@@ -231,8 +252,8 @@ Models live in config, not code.
 | research | Claude Haiku 5.5, then Codex gpt-6-luna, then Gemini Flash | read + web |
 | light | Claude Haiku 5.5, then Gemini Flash, then Codex gpt-6-luna | read |
 
-crew skips the caller's own vendor, so from Claude Code these roles go to Codex or Gemini, and
-Haiku 5.5 runs them when Codex or agy is in charge. Claude agents use full model ids
+crew skips the caller's own model family, so from Claude Code the last three roles go to Codex or
+Gemini, and Haiku 5.5 runs them when Codex or agy is in charge. Claude agents use full model ids
 (`claude:claude-haiku-5-5`) because Claude Code's aliases can lag a release.
 
 Change them from the command line:
@@ -283,6 +304,10 @@ or when you want a per-task permission scope and a readable record of every prom
 | unexpected `scope-violation` | your own edits during the run count too |
 | Codex on Windows can't run any command | set up its sandbox. From a remote or service session (Windows session 0) it can't work at all; `doctor` warns about this |
 | no tab opens | run `crew.py doctor`, or use `--view hidden` |
+| status `limited` | the vendor's usage limit was hit; `note` says whether the task moved to another agent. `crew.py quota` shows when limits reset |
+| cost shows `?` | your claude CLI has no price for that model and guessed; update the claude CLI |
+| fact check says a site "could not be checked" | the site blocks automated requests; the link may be fine, so open it yourself |
+| old tabs pile up | finished tabs wait for Enter while `hold` is on; set `"hold": false`, or pass `--no-hold` |
 
 ## Development
 
@@ -293,6 +318,26 @@ python -m unittest discover -s tests -v
 The tests use stand-in agents, so they need no accounts. CI runs them on Linux, Windows and
 macOS, and checks the skill against the
 [Agent Skills specification](https://agentskills.io/specification).
+
+## Changes
+
+**1.2.0**
+- When an agent hits its vendor's usage limit, the task moves to the next agent in the role, and
+  the vendor is skipped until its limit resets.
+- crew records each vendor's usage windows (Claude and Codex report them). `light` and
+  `implement-light` prefer the vendor with the most left. `crew.py quota` shows the state.
+- crew picks a second opinion by model family, not CLI, so a Claude model run through agy no longer
+  counts as a different vendor from Claude.
+- `--panel` sends one task to several model families at once.
+- Fact check after web tasks: cited URLs and package versions (crates.io, PyPI, npm). It refuses
+  local and private addresses, including through redirects. `crew.py check` re-runs it.
+
+**1.1.0**
+- Claude Haiku 5.5 leads the fast roles. Default Claude agents use full model ids, because Claude
+  Code's short aliases can lag a release.
+- Each run records the model that actually ran, every helper model it used, and the session that
+  sent it. A follow-up's cost no longer includes the earlier runs in its session.
+- `stats` shows cost. Web tasks are told today's date, and write tasks must report the checks they ran.
 
 ## Credits
 

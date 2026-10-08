@@ -287,7 +287,7 @@ class TestReviewFindings(unittest.TestCase):
 
     def test_other_spellings_of_local_addresses_are_refused(self):
         for host in ("2130706433", "0x7f000001", "127.1", "0177.0.0.1", "0", "[::ffff:127.0.0.1]",
-                     "169.254.169.254", "192.168.1.93", "printer.localhost"):
+                     "169.254.169.254", "192.168.0.10", "printer.localhost"):
             self.assertFalse(crew.url_allowed(f"http://{host}/x"), host)
 
     def test_names_resolving_to_private_addresses_are_refused(self):
