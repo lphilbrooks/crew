@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "skills" / "crew" / "scripts"))
 import crew  # noqa: E402
 
-NOW = time.time()
+
 
 
 class Routing(unittest.TestCase):
@@ -97,23 +97,23 @@ class TestQuota(Routing):
         self.assertAlmostEqual(entry["limited_until"], time.time() + 3600, delta=5)
 
     def test_high_window_skips_backend(self):
-        self.set_windows("codex", {"five_hour": {"used": 0.97, "resets_at": NOW + 600}})
+        self.set_windows("codex", {"five_hour": {"used": 0.97, "resets_at": time.time() + 600}})
         self.assertEqual(self.backends(["codex:m", "claude:c"]), ["claude:c"])
 
     def test_all_exhausted_keeps_them_with_note(self):
-        self.set_windows("codex", {"five_hour": {"used": 0.99, "resets_at": NOW + 600}})
-        self.set_windows("claude", {"five_hour": {"used": 1.0, "resets_at": NOW + 600}})
+        self.set_windows("codex", {"five_hour": {"used": 0.99, "resets_at": time.time() + 600}})
+        self.set_windows("claude", {"five_hour": {"used": 1.0, "resets_at": time.time() + 600}})
         spec, _, note = crew.choose_agent(self.cfg, ["codex:m", "claude:c"])
         self.assertEqual(spec["backend"], "codex")
         self.assertIn("all candidates are near their usage limit", note)
 
     def test_expired_window_ignored(self):
-        self.set_windows("codex", {"five_hour": {"used": 0.99, "resets_at": NOW - 10}})
+        self.set_windows("codex", {"five_hour": {"used": 0.99, "resets_at": time.time() - 10}})
         self.assertEqual(self.backends(["codex:m", "claude:c"]), ["codex:m", "claude:c"])
         self.assertEqual(crew.quota_score(crew.read_quota()["codex"]), 0.0)
 
     def test_expired_limit_ignored(self):
-        entry = {"windows": {}, "limited_until": NOW - 10}
+        entry = {"windows": {}, "limited_until": time.time() - 10}
         self.assertEqual(crew.quota_score(entry), 0.0)
 
     def test_record_quota_keeps_limit(self):
