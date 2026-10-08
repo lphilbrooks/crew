@@ -362,9 +362,9 @@ class TestPreambleAndDefaults(unittest.TestCase):
         installed = lambda c, b: [b]  # noqa: E731
         saved, crew.backend_cmd = crew.backend_cmd, installed
         try:
-            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="claude")
+            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="claude", quota={})
             self.assertEqual(spec["backend"], "codex")
-            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="codex")
+            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="codex", quota={})
             self.assertEqual(crew.spec_str(spec), "claude:claude-haiku-5-5@medium")
         finally:
             crew.backend_cmd = saved

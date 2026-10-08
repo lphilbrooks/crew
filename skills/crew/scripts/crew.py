@@ -1959,6 +1959,8 @@ class View:
     def show(self, text: str, style=None) -> None:
         out = f"\x1b[{COLOURS[style]}m{text}\x1b[0m" if style and self.colour else text
         print(out, flush=True)
+        if self.raw.closed:  # crew's own notes after the agent has finished still belong in the log
+            self.raw = open(self.raw.name, "a", encoding="utf-8")
         self.raw.write(text + "\n")
         self.raw.flush()
 
@@ -2341,10 +2343,13 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         record_limit(backend, resets, load_config().get("limit_cooldown_minutes", 60))
         note = f"{backend} hit its usage limit" + (f" (resets {dt.datetime.fromtimestamp(resets):%H:%M %d %b})"
                                                    if resets else "") + (f": {note}" if note else "")
-        if (cmd.get("request") or {}).get("retry"):
+        req = cmd.get("request") or {}
+        if req.get("retry"):
             retried_as, retry_note = retry_elsewhere(task)
             note += f"; {retry_note}"
             view.show(f"crew: {retry_note}", "yellow")
+        elif req and not req.get("agent") and not cmd.get("panel"):
+            note += "; not retried: no other eligible agent for this role"
 
     checks = None
     if status == "ok" and cmd.get("fact_check"):
@@ -2372,6 +2377,7 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         "status": status, "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
         "cost_reliable": view.cost_note is None, "resumed_from": cmd.get("resumed_from"),
         "retry_of": cmd.get("retry_of"), "panel": cmd.get("panel"), "dir": task.name}))
+    view.raw.close()
     colour, reset = ("\x1b[32m" if status == "ok" else "\x1b[31m", "\x1b[0m") if view.colour else ("", "")
     print("-" * 72)
     print(f"{colour}crew  {status}  exit={rc}  {seconds}s"
