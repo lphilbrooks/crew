@@ -5,6 +5,9 @@
   "hold": true,
   "max_minutes": 60,
   "terminal": null,
+  "balance_step": 0.25,
+  "unknown_quota": 0.5,
+  "limit_cooldown_minutes": 60,
 
   "backends": {
     "codex": {
@@ -61,6 +64,7 @@
       "access": "write",
       "web": false,
       "network": false,
+      "balance": true,
       "about": "Cheap mechanical work: boilerplate, fixtures, test scaffolding, docs from code."
     },
     "research": {
@@ -75,6 +79,7 @@
       "access": "read",
       "web": false,
       "network": false,
+      "balance": true,
       "about": "Light read-only work: summarise files or logs, draft prose, simple lookups."
     }
   }

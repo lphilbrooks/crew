@@ -210,24 +210,53 @@ def caller_session():
     return None
 
 
-def choose_agent(cfg: dict, ref, caller=None, explicit=False):
-    """First installed candidate. Unless the agent was named explicitly, candidates from the
-    caller's own vendor are skipped when another installed candidate exists.
-    Returns (spec, argv prefix, note or None)."""
+def choose_agent(cfg: dict, ref, caller=None, explicit=False, balance=None, quota=None):
+    """First eligible candidate. Returns (spec, argv prefix, note or None)."""
+    return candidates_for(cfg, ref, caller, bool(balance), quota, explicit)[0]
+
+
+def candidates_for(cfg: dict, ref, caller=None, balance=False, quota=None, explicit=False) -> list:
+    """Eligible candidates for a role, best first, as (spec, argv prefix, note or None).
+
+    Rules, in order: an explicitly named agent is honoured as is; candidates from the caller's
+    model family are dropped (an agy Claude model is Claude, whatever the backend); candidates
+    whose backend is near its usage limit are dropped; with `balance`, the rest are ordered by
+    remaining headroom, keeping the configured order among similar ones. Each filter is skipped
+    rather than leaving no candidate at all."""
     candidates = expand_agent(cfg, ref)
-    installed = [(s, backend_cmd(cfg, s["backend"])) for s in candidates]
-    installed = [(s, c) for s, c in installed if c]
+    installed = [(s, c) for s, c in ((s, backend_cmd(cfg, s["backend"])) for s in candidates) if c]
     if not installed:
         raise CrewError(
             f"No installed backend for agent '{ref}' (tried {', '.join(map(spec_str, candidates))}). "
             "Run `crew.py doctor`.")
-    if caller and not explicit:
-        others = [(s, c) for s, c in installed if s["backend"] != caller]
+    if explicit:
+        return [(installed[0][0], installed[0][1], None)]
+    notes = []
+    family = CALLER_FAMILY.get(caller)
+    if family:
+        others = [(s, c) for s, c in installed if model_family(s) != family]
         if others:
-            return others[0][0], others[0][1], None
-        return installed[0][0], installed[0][1], (
-            f"{installed[0][0]['backend']} is also the caller; no other installed candidate for this role")
-    return installed[0][0], installed[0][1], None
+            installed = others
+        else:
+            notes.append(f"{family} is also the caller's model family; no other installed candidate for this role")
+    if quota is None:
+        quota = read_quota()
+    ready = [(s, c) for s, c in installed if not quota_exhausted(_quota_entry(quota, s["backend"]))]
+    if ready:
+        installed = ready
+    else:
+        notes.append("all candidates are near their usage limit")
+    if balance:
+        step = float(cfg.get("balance_step", 0.25))
+        unknown = float(cfg.get("unknown_quota", 0.5))
+
+        def bucket(item):
+            score = quota_score(_quota_entry(quota, item[0]["backend"]))
+            return (unknown if score is None else score) // step
+
+        installed = sorted(installed, key=bucket)
+    note = "; ".join(notes) or None
+    return [(s, c, note) for s, c in installed]
 
 
 def codex_home() -> Path:
@@ -271,6 +300,185 @@ def cli_help(cmd: list) -> str:
         except (OSError, subprocess.TimeoutExpired):
             _help_cache[key] = ""
     return _help_cache[key]
+
+
+# ---------------------------------------------------------------------- quota
+
+# Model families. agy runs Claude, GPT and Gemini models, so its family comes from the model
+# name; a Claude Code caller should not count an agy Claude model as a second vendor.
+CALLER_FAMILY = {"codex": "openai", "claude": "anthropic", "agy": "google"}
+QUOTA_FILE = CREW_HOME / "quota.json"
+CODEX_DAY_LIMIT = 400  # newest session-log day folders searched for a task's session
+CODEX_WINDOW_NAMES = {300: "five_hour", 10080: "seven_day"}
+LIMIT_RE = re.compile(
+    r"hit your (?:\w+ )?usage limit|usage limit (?:reached|exceeded)"
+    r"|\brate[ _-]?limit(?:ed)?\b|rate_limit_error|too many requests|quota exceeded|resource[ _]exhausted"
+    r"|\b(?:status|http|error|code)\W{0,3}429\b|\b429\b\s*(?:too many|rate|quota)",
+    re.IGNORECASE)
+
+
+def model_family(spec: dict) -> str:
+    if spec["backend"] == "agy":
+        model = spec["model"].lower()
+        if model.startswith("claude"):
+            return "anthropic"
+        if model.startswith("gpt"):
+            return "openai"
+        return "google"
+    return {"codex": "openai", "claude": "anthropic"}.get(spec["backend"], spec["backend"])
+
+
+def read_quota() -> dict:
+    try:
+        data = read_json(QUOTA_FILE)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _quota_entry(quota: dict, backend: str) -> dict:
+    entry = quota.get(backend)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _save_quota(quota: dict) -> None:
+    try:
+        QUOTA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        write_json(QUOTA_FILE, quota)
+    except OSError:  # quota is advisory; a failed write must not fail a run
+        pass
+
+
+def record_quota(backend: str, windows: dict, source: str) -> None:
+    """Replace a backend's usage windows, keeping any limit already recorded for it."""
+    quota = read_quota()
+    entry = _quota_entry(quota, backend)
+    entry.setdefault("limited_until", None)
+    entry.update({"windows": windows, "updated": now_iso(), "source": source})
+    quota[backend] = entry
+    _save_quota(quota)
+
+
+def record_limit(backend: str, resets_at=None, cooldown_minutes: float = 60) -> None:
+    """The backend hit its limit: blocked until the reset time if known, else for a cooldown."""
+    now = time.time()
+    until = resets_at if resets_at and resets_at > now else now + cooldown_minutes * 60
+    quota = read_quota()
+    entry = _quota_entry(quota, backend)
+    entry.setdefault("windows", {})
+    entry.setdefault("source", "limit")
+    entry.update({"limited_until": until, "updated": now_iso()})
+    quota[backend] = entry
+    _save_quota(quota)
+
+
+def quota_score(entry, now=None):
+    """How full a backend is (0-1) from the windows still in effect; None if nothing is known."""
+    if not isinstance(entry, dict):
+        return None
+    now = time.time() if now is None else now
+    windows = entry.get("windows")
+    windows = windows if isinstance(windows, dict) else {}
+    limited = entry.get("limited_until")
+    if not windows and limited is None:
+        return None
+    scores = [0.0]  # a window whose reset time has passed no longer counts
+    for w in windows.values():
+        if isinstance(w, dict) and (w.get("resets_at") is None or w["resets_at"] > now):
+            scores.append(float(w.get("used") or 0))
+    if limited is not None and limited > now:
+        scores.append(1.0)
+    return max(scores)
+
+
+def quota_exhausted(entry, now=None, threshold: float = 0.95) -> bool:
+    score = quota_score(entry, now)
+    return score is not None and score >= threshold
+
+
+def claude_quota_windows(event: dict):
+    """Usage windows from a Claude Code stream-json rate_limit_event, or None."""
+    if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
+        return None
+    info = event.get("rate_limit_info")
+    info = info if isinstance(info, dict) else {}
+    unified = info.get("unifiedWindows")
+    unified = unified if isinstance(unified, dict) else {}
+    windows = {name: {"used": float(w.get("utilization") or 0), "resets_at": w.get("resetsAt")}
+               for name, w in unified.items() if isinstance(w, dict)}
+    if windows:
+        return windows
+    if info.get("status", "allowed") != "allowed":
+        return {"limit": {"used": 1.0, "resets_at": info.get("resetsAt")}}
+    return None
+
+
+def _find_key(obj, key: str):
+    """First non-empty dict stored under `key` anywhere inside a parsed JSON value."""
+    if isinstance(obj, dict):
+        value = obj.get(key)
+        if isinstance(value, dict) and value:
+            return value
+        children = obj.values()
+    elif isinstance(obj, list):
+        children = obj
+    else:
+        return None
+    for child in children:
+        found = _find_key(child, key)
+        if found:
+            return found
+    return None
+
+
+def _codex_session_log(base: Path, session_id: str):
+    suffix = f"-{session_id}.jsonl"
+    days = sorted((p for p in base.glob("*/*/*") if p.is_dir()), reverse=True)[:CODEX_DAY_LIMIT]
+    for day in days:
+        for p in day.iterdir():
+            if p.name.startswith("rollout-") and p.name.endswith(suffix):
+                return p
+    return None
+
+
+def codex_quota_windows(session_id: str, sessions_dir=None):
+    """Latest rate limits Codex wrote into a task's session log, or None. Never raises."""
+    if not session_id:
+        return None
+    try:
+        base = Path(sessions_dir) if sessions_dir else codex_home() / "sessions"
+        log = _codex_session_log(base, session_id)
+        if log is None:
+            return None
+        found = None
+        with open(log, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"rate_limits"' not in line:
+                    continue
+                try:
+                    rl = _find_key(json.loads(line), "rate_limits")
+                except ValueError:
+                    continue
+                windows = {}
+                for w in (rl or {}).values():
+                    if isinstance(w, dict) and w.get("used_percent") is not None:
+                        name = CODEX_WINDOW_NAMES.get(w.get("window_minutes"), f"{w.get('window_minutes')}_min")
+                        windows[name] = {"used": float(w["used_percent"]) / 100, "resets_at": w.get("resets_at")}
+                if windows:
+                    found = windows
+        return found
+    except (OSError, ValueError):
+        return None
+
+
+def looks_rate_limited(text: str) -> bool:
+    return bool(LIMIT_RE.search(text or ""))
+
+
+def limit_reset_from_text(text: str):
+    """Epoch reset time from text such as 'usage limit reached|1791458400', else None."""
+    m = re.search(r"\|\s*(\d{10})\b", text or "")
+    return float(m[1]) if m else None
 
 
 # --------------------------------------------------------------------- scope
@@ -1048,9 +1256,9 @@ def cmd_stats(args) -> int:
     return 0
 
 
-def describe_agent(cfg, ref, caller=None) -> str:
+def describe_agent(cfg, ref, caller=None, balance=False) -> str:
     try:
-        spec, _, note = choose_agent(cfg, ref, caller)
+        spec, _, note = choose_agent(cfg, ref, caller, balance=balance)
     except CrewError as e:
         msg = str(e)
         return ("NOT INSTALLED" if msg.startswith("No installed") else "INVALID") + f" ({msg})"
@@ -1067,9 +1275,11 @@ def cmd_roles(args) -> int:
         print(f"  {name:<18} {json.dumps(ref)}  ->  {describe_agent(cfg, name)}")
     print("\nRoles:")
     for name, r in (cfg.get("roles") or {}).items():
-        print(f"  {name:<18} agent={json.dumps(r.get('agent'))} -> {describe_agent(cfg, r.get('agent'), caller)}")
+        balance = bool(r.get("balance"))
+        print(f"  {name:<18} agent={json.dumps(r.get('agent'))} -> {describe_agent(cfg, r.get('agent'), caller, balance)}")
         print(f"  {'':<18} access={r.get('access', 'read')} web={on_off(r.get('web'))} "
-              f"network={on_off(r.get('network'))}{' mode=review' if r.get('mode') == 'review' else ''}")
+              f"network={on_off(r.get('network'))}{' mode=review' if r.get('mode') == 'review' else ''}"
+              f"{' balance=on' if balance else ''}")
         if r.get("about"):
             print(f"  {'':<18} {r['about']}")
     return 0
