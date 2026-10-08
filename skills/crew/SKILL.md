@@ -15,7 +15,7 @@ compatibility: >-
   signed in, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # crew
@@ -98,6 +98,9 @@ Independent tasks can run in parallel. Parallel `write` tasks in one repository 
 different files, and each task must say which.
 
 `--wait` prints the status, the scope, any violations or changed files, and the agent's answer.
+If the model that ran differs from the one asked for, it says so (`ran <model>`): Claude Code
+resolves short names itself and can lag a release. The fast roles use Claude Haiku 5.5 at
+`medium` effort; pass `--effort high` for knowledge-heavy research.
 It exits 0 for ok, 2 for any other status, 3 if the wait timed out and 1 for usage errors.
 
 ## Statuses

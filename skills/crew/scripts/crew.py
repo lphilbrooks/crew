@@ -201,6 +201,15 @@ def detect_caller():
     return None
 
 
+def caller_session():
+    """The calling agent's own session id, so a run can be traced back to the conversation that
+    dispatched it. Read here only; it is still removed from the delegated agent's environment."""
+    for var in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+        if os.environ.get(var):
+            return os.environ[var]
+    return None
+
+
 def choose_agent(cfg: dict, ref, caller=None, explicit=False):
     """First installed candidate. Unless the agent was named explicitly, candidates from the
     caller's own vendor are skipped when another installed candidate exists.
@@ -341,6 +350,8 @@ def scope_preamble(backend: str, scope: dict, scratch: Path, top, agy_fetch: boo
             "Changes are detected and reported as violations.")
     else:
         lines.append("You may edit files in the working directory as the task requires. Keep changes within the task.")
+        lines.append("Before reporting the work done, run the checks the task names (or the project's tests, build "
+                     "or type-check) and report their results. If a check could not run, say which and why.")
     if access != "read":
         lines.append("Do not run git add, commit, push, checkout, reset, stash or clean; leave changes uncommitted.")
     if backend in ("codex", "claude") and access != "read":
@@ -352,6 +363,8 @@ def scope_preamble(backend: str, scope: dict, scratch: Path, top, agy_fetch: boo
             lines.append("You may use web search, but page fetching is not permitted here: work from search results only.")
         else:
             lines.append("You may use web search and read web pages.")
+        lines.append(f"Today's date is {dt.date.today().isoformat()}. Versions, prices and anything \"latest\" may "
+                     "have changed since your training data, so search for them rather than answering from memory.")
         lines.append("Cite the URLs you rely on.")
     else:
         lines.append("Do not use web search or fetch URLs.")
@@ -760,12 +773,18 @@ def print_result(task: Path) -> int:
     r = read_json(task / "result.json")
     scope = r.get("scope") or {}
     secs = r.get("seconds")
-    line = f"crew: {r.get('status')} | role={r.get('role')} agent={r.get('agent')} | {'?' if secs is None else secs}s"
+    line = f"crew: {r.get('status')} | role={r.get('role')} agent={r.get('agent')}"
+    resolved = r.get("resolved_model")
+    if resolved and resolved != r.get("model"):
+        line += f" (ran {resolved})"
+    line += f" | {'?' if secs is None else secs}s"
     if r.get("tokens"):
         line += f" | tokens={r['tokens']}"
     if r.get("cost_usd"):
-        line += f" | cost=${r['cost_usd']:.2f}"
+        line += f" | cost=${r['cost_usd']:.2f}" + ("?" if r.get("cost_note") else "")
     print(line)
+    if r.get("cost_note"):
+        print(f"crew: {r['cost_note']}")
     if scope:
         print(f"crew: scope access={scope.get('access')} web={on_off(scope.get('web'))} network={on_off(scope.get('network'))}")
     print(f"crew: dir={task}")
@@ -831,6 +850,7 @@ def cmd_run(args) -> int:
     caller = resolve_caller(args.caller)
     choice_note = None
     session = None
+    prior_cost = None
     if args.resume:
         prev = Path(args.resume).expanduser().resolve()
         try:
@@ -844,6 +864,8 @@ def cmd_run(args) -> int:
             raise CrewError(f"No session id recorded in {prev / 'result.json'}")
         if not text:
             raise CrewError("--resume needs the follow-up instructions (--task or --task-file)")
+        # Results written before session_cost_usd existed stored the session total in cost_usd.
+        prior_cost = pr.get("session_cost_usd", pr.get("cost_usd"))
         role, cwd, scope = pc["role"], Path(pc["cwd"]), pc["scope"]
         spec = parse_spec(pc["agent"])
         exe = backend_cmd(cfg, spec["backend"])
@@ -928,9 +950,10 @@ def cmd_run(args) -> int:
 
     write_json(task / "cmd.json", {
         "role": role, "agent": agent_label, "backend": backend, "model": spec["model"], "effort": effort,
-        "caller": caller, "scope": scope, "enforcement": enf, "cwd": str(cwd), "git_top": top,
-        "argv": argv, "stdin": use_stdin, "env": env, "allowed_paths": allowed, "max_minutes": max_minutes,
-        "resumed_from": str(args.resume) if args.resume else None, "created": now_iso()})
+        "caller": caller, "caller_session": caller_session(), "scope": scope, "enforcement": enf,
+        "cwd": str(cwd), "git_top": top, "argv": argv, "stdin": use_stdin, "env": env, "allowed_paths": allowed,
+        "max_minutes": max_minutes, "resumed_from": str(prev) if args.resume else None,
+        "prior_session_cost_usd": prior_cost, "created": now_iso()})
 
     runner = [sys.executable, "-u", str(Path(__file__).resolve()), "_run", "--dir", str(task)]
     view = args.view or cfg.get("view", "auto")
@@ -987,20 +1010,41 @@ def cmd_stats(args) -> int:
     if not LEDGER.exists():
         print("crew: no tasks yet")
         return 0
-    groups = {}
+    rows = []
     for line in LEDGER.read_text(encoding="utf-8").splitlines():
         try:
-            row = json.loads(line)
+            rows.append(json.loads(line))
         except ValueError:
             continue
-        g = groups.setdefault(f"{row.get('backend')}:{row.get('model')}", {"tasks": 0, "ok": 0, "sec": 0.0, "tokens": 0})
+    # Rows written before resumed_from was logged recorded a resumed claude run's whole-session
+    # cost. Subtract what the run it continued already recorded, using the run folder if it is kept.
+    logged = {r.get("dir"): r.get("cost_usd") for r in rows}
+    for r in rows:
+        if "resumed_from" in r or not isinstance(r.get("cost_usd"), (int, float)):
+            continue
+        try:
+            prev = read_json(RUNS_DIR / str(r.get("dir")) / "cmd.json").get("resumed_from")
+        except (OSError, ValueError):
+            continue
+        before = logged.get(Path(prev).name) if prev else None
+        if isinstance(before, (int, float)):
+            r["cost_usd"] = max(r["cost_usd"] - before, 0.0)
+    groups = {}
+    for row in rows:
+        name = f"{row.get('backend')}:{row.get('resolved_model') or row.get('model')}"
+        g = groups.setdefault(name, {"tasks": 0, "ok": 0, "sec": 0.0, "tokens": 0, "cost": 0.0, "guess": False})
         g["tasks"] += 1
         g["ok"] += row.get("status") == "ok"
         g["sec"] += float(row.get("seconds") or 0)
         g["tokens"] += int(row.get("tokens") or 0)
-    print(f"{'backend:model':<36} {'tasks':>5} {'ok':>4} {'minutes':>8} {'tokens':>12}")
+        g["cost"] += float(row.get("cost_usd") or 0)
+        g["guess"] |= row.get("cost_reliable") is False
+    print(f"{'backend:model':<40} {'tasks':>5} {'ok':>4} {'minutes':>8} {'tokens':>12} {'cost $':>9}")
     for name, g in sorted(groups.items()):
-        print(f"{name:<36} {g['tasks']:>5} {g['ok']:>4} {g['sec'] / 60:>8.1f} {g['tokens']:>12}")
+        cost = f"{g['cost']:.2f}{'?' if g['guess'] else ''}" if g["cost"] else "-"
+        print(f"{name:<40} {g['tasks']:>5} {g['ok']:>4} {g['sec'] / 60:>8.1f} {g['tokens']:>12} {cost:>9}")
+    print("\ncost is the API list price the CLI reports (claude only; codex and agy report none). "
+          "On a subscription it measures usage, not money. '?' = the CLI had no price for that model.")
     return 0
 
 
@@ -1040,11 +1084,13 @@ def cmd_models(args) -> int:
     for m in cm or []:
         efforts = ",".join(e.get("effort", "") for e in m.get("supported_reasoning_levels") or [])
         print(f"  codex:{m.get('slug'):<22} {m.get('description', '')}  [effort: {efforts}]")
-    print("\nclaude (aliases that follow Anthropic's latest release; full model names also work):")
+    print("\nclaude (short aliases, or full model ids such as claude:claude-haiku-5-5):")
     if backend_cmd(cfg, "claude"):
         for alias in CLAUDE_ALIASES:
             print(f"  claude:{alias}")
         print("  [effort: low,medium,high,xhigh,max]")
+        print("  Aliases are resolved by your claude CLI and can lag a release (claude 2.1.286 still maps\n"
+              "  haiku to Haiku 4.5). Each run records the model that actually ran as resolved_model.")
     else:
         print("  (claude not installed)")
     print("\nagy (from `agy models`):")
@@ -1175,7 +1221,12 @@ def cmd_doctor(args) -> int:
                        "tasks run unsandboxed (instructions + git check). Use WSL2 for a hard boundary.")
             for name, r in (cfg.get("roles") or {}).items():
                 for spec in expand_agent(cfg, r.get("agent")):
-                    if spec["backend"] == "claude" and "-" not in spec["model"] and spec["model"] not in CLAUDE_ALIASES:
+                    if spec["backend"] != "claude":
+                        continue
+                    if spec["model"] in CLAUDE_ALIASES:
+                        report(None, f"role {name}", f"claude:{spec['model']} is an alias your claude CLI resolves, and "
+                               "aliases can lag a release; a full id (e.g. claude-opus-5-5) is exact")
+                    elif "-" not in spec["model"]:
                         report(None, f"role {name}", f"claude model '{spec['model']}' is neither an alias nor a full name")
         if backend == "agy":
             fetch = agy_fetch_allowed(cfg)
@@ -1263,6 +1314,9 @@ class View:
         self.cost = None
         self.error = None
         self.denied = []
+        self.resolved_model = None  # the model the backend reports it ran, when it says
+        self.model_usage = None  # per-model tokens and cost, including hidden helper models
+        self.cost_note = None  # set when the reported cost can't be trusted
 
     def show(self, text: str, style=None) -> None:
         out = f"\x1b[{COLOURS[style]}m{text}\x1b[0m" if style and self.colour else text
@@ -1394,6 +1448,7 @@ class ClaudeView(JsonView):
         kind = e.get("type")
         if kind == "system" and e.get("subtype") == "init":
             self.session = e.get("session_id") or self.session
+            self.resolved_model = e.get("model") or self.resolved_model
             self.show(f"session {self.session}  model {e.get('model')}  tools {','.join(e.get('tools') or [])}", "dim")
         elif kind == "assistant":
             for block in (e.get("message") or {}).get("content") or []:
@@ -1420,7 +1475,29 @@ class ClaudeView(JsonView):
             u = e.get("usage") or {}
             self.tokens = (int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
                            + int(u.get("cache_creation_input_tokens") or 0)) or None
+            # total_cost_usd covers the whole session, earlier --resume runs included; the runner
+            # subtracts what earlier runs already recorded.
             self.cost = e.get("total_cost_usd")
+            mu = e.get("modelUsage")
+            if isinstance(mu, dict) and mu:
+                self.model_usage = {
+                    name: {"input": int(m.get("inputTokens") or 0), "output": int(m.get("outputTokens") or 0),
+                           "cache_read": int(m.get("cacheReadInputTokens") or 0),
+                           "cache_write": int(m.get("cacheCreationInputTokens") or 0),
+                           "web_searches": int(m.get("webSearchRequests") or 0),
+                           "cost_usd": m.get("costUSD"), "cost_basis": m.get("costBasis")}
+                    for name, m in mu.items() if isinstance(m, dict)}
+                # Tools such as WebSearch run on a helper model; its tokens belong in the count too.
+                self.tokens = sum(m["input"] + m["output"] + m["cache_write"]
+                                  for m in self.model_usage.values()) or self.tokens
+                unpriced = sorted(n for n, m in self.model_usage.items()
+                                  if m["cost_basis"] not in (None, "list"))
+                if unpriced:
+                    self.cost_note = (f"claude has no price list for {', '.join(unpriced)}, so its cost "
+                                      "figure is a guess; update the claude CLI")
+                helpers = sorted(n for n in self.model_usage if n != self.resolved_model)
+                if helpers and self.resolved_model:
+                    self.show(f"helper models: {', '.join(helpers)}", "dim")
             self.denied = sorted({str(d.get("tool_name")) for d in e.get("permission_denials") or [] if isinstance(d, dict)})
             if e.get("is_error"):
                 self.error = short(e.get("result") or e.get("subtype") or "claude reported an error", 400)
@@ -1591,16 +1668,23 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         note = (f"{len(violations)} file(s) changed outside what access={cmd['scope']['access']} allows. "
                 "If you edited the repo yourself during the run, those edits are included.")
     seconds = round(time.time() - started, 1)
+    session_cost = view.cost
+    cost = session_cost
+    if isinstance(session_cost, (int, float)) and isinstance(cmd.get("prior_session_cost_usd"), (int, float)):
+        cost = max(session_cost - cmd["prior_session_cost_usd"], 0.0)
+    resolved = view.resolved_model or cmd["model"]
     result = {"status": status, "note": note, "exit": rc, "role": cmd["role"], "agent": cmd["agent"],
-              "backend": cmd["backend"], "model": cmd["model"], "scope": cmd["scope"], "seconds": seconds,
-              "tokens": view.tokens, "cost_usd": view.cost, "session_id": view.session,
-              "touched_files": touched, "violations": violations, "denied_tools": view.denied,
-              "final": str(final), "finished": now_iso()}
+              "backend": cmd["backend"], "model": cmd["model"], "resolved_model": resolved,
+              "scope": cmd["scope"], "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
+              "session_cost_usd": session_cost, "cost_note": view.cost_note, "model_usage": view.model_usage,
+              "session_id": view.session, "touched_files": touched, "violations": violations,
+              "denied_tools": view.denied, "final": str(final), "finished": now_iso()}
     write_json(task / "result.json", result)
     append_line(LEDGER, json.dumps({
         "ts": now_iso(), "role": cmd["role"], "backend": cmd["backend"], "model": cmd["model"],
-        "caller": cmd.get("caller"), "status": status, "seconds": seconds, "tokens": view.tokens,
-        "cost_usd": view.cost, "dir": task.name}))
+        "resolved_model": resolved, "caller": cmd.get("caller"), "caller_session": cmd.get("caller_session"),
+        "status": status, "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
+        "cost_reliable": view.cost_note is None, "resumed_from": cmd.get("resumed_from"), "dir": task.name}))
     colour, reset = ("\x1b[32m" if status == "ok" else "\x1b[31m", "\x1b[0m") if view.colour else ("", "")
     print("-" * 72)
     print(f"{colour}crew  {status}  exit={rc}  {seconds}s"

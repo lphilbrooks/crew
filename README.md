@@ -97,12 +97,20 @@ built so that a person can follow every step.
   | `task.md` | the exact prompt sent, in Markdown |
   | `final.md` | the agent's answer, in Markdown |
   | `raw.log` | everything the tab showed |
-  | `cmd.json` | the exact command, model and permissions |
-  | `result.json` | status, time, tokens, cost and any changed files |
+  | `cmd.json` | the exact command, model, permissions, and the session that sent the task |
+  | `result.json` | status, time, tokens, cost, the model that actually ran, and any changed files |
+  | `events.jsonl` | the full event stream, for Codex and Claude |
 
 - **Easy to review across agents.** Prompts and answers sit side by side as readable Markdown, so
   you can check one agent's work against another's, or see why your agent made a decision.
-  `crew.py status` lists recent runs, and `crew.py stats` shows usage per model.
+  `crew.py status` lists recent runs, and `crew.py stats` shows usage and cost per model.
+- **Linked both ways.** `cmd.json` records the calling agent's session id (`caller_session`), so a
+  run can be traced to the conversation that sent it, and `resumed_from` links each follow-up to
+  the run it continued.
+- **Honest about models and cost.** Claude Code resolves short names like `haiku` itself, and
+  older versions lag a release, so each run records `resolved_model`. Tools such as web search
+  run on a helper model; `model_usage` lists every model a run used and what each cost. A
+  follow-up's `cost_usd` covers that follow-up only (the session total is `session_cost_usd`).
 
 Run folders are never deleted automatically. Remove old ones whenever you like.
 
@@ -202,9 +210,13 @@ Models live in config, not code.
 | review | Codex gpt-6.1-sol (high), Claude Opus | verify |
 | check | same | verify |
 | implement | Codex gpt-6.1-sol (medium), Claude Sonnet | write |
-| implement-light | Codex gpt-6-luna, Claude Haiku | write |
-| research | Gemini Flash, then Codex, then Claude | read + web |
-| light | same | read |
+| implement-light | Claude Haiku 5.5, Codex gpt-6-luna | write |
+| research | Claude Haiku 5.5, then Codex gpt-6-luna, then Gemini Flash | read + web |
+| light | Claude Haiku 5.5, then Gemini Flash, then Codex gpt-6-luna | read |
+
+crew skips the caller's own vendor, so from Claude Code these roles go to Codex or Gemini, and
+Haiku 5.5 runs them when Codex or agy is in charge. Claude agents use full model ids
+(`claude:claude-haiku-5-5`) because Claude Code's aliases can lag a release.
 
 Change them from the command line:
 
@@ -231,7 +243,15 @@ Tabs open automatically in Windows Terminal, Terminal.app (untested) or tmux.
 
 Tasks, and any files the agent reads, go to that vendor under your plan and its data terms.
 Don't put secrets in a task, since run folders keep a copy. Every task uses your quota;
-`crew.py stats` shows the split.
+`crew.py stats` shows the split. The cost column is the API list price Claude Code reports
+(Codex and agy report none). A `?` means your claude CLI had no price for that model (update it).
+
+## When not to use crew
+
+If the work doesn't need another vendor, your agent's own subagents are simpler: no extra
+process, no task brief to write, and the result comes straight back. crew earns its place when a
+different model family should check the work, when you want to spread work across subscriptions,
+or when you want a per-task permission scope and a readable record of every prompt and answer.
 
 ## Troubleshooting
 

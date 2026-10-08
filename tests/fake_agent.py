@@ -1,7 +1,7 @@
 """Stand-in for the codex and agy CLIs, so tests exercise crew end to end without a vendor.
 
 Usage: fake_agent.py codex|agy <real CLI arguments...>
-Behaviour switches (environment): FAKE_MODE = ok | fail | touch | deny | sleep | silent
+Behaviour switches (environment): FAKE_MODE = ok | fail | touch | deny | sleep | silent | unpriced
 """
 import json
 import os
@@ -49,7 +49,7 @@ if kind == "claude":
     denials = [{"tool_name": "Bash", "tool_input": {"command": "rm -rf x"}}] if mode == "deny" else []
     events = [
         {"type": "system", "subtype": "init", "session_id": "11111111-1111-1111-1111-111111111111",
-         "model": "fake", "tools": ["Read"]},
+         "model": "claude-fake-9-9", "tools": ["Read"]},
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read",
                                                        "input": {"file_path": "a.txt"}}]}},
         {"type": "user", "message": {"content": [{"type": "tool_result", "content": "one"}]}},
@@ -58,8 +58,16 @@ if kind == "claude":
         events.append({"type": "assistant", "message": {"content": [{"type": "text", "text": answer}]}})
     events.append({"type": "result", "subtype": "success", "is_error": mode == "fail",
                    "result": "" if mode in ("silent", "deny") else answer, "session_id": "11111111-1111-1111-1111-111111111111",
-                   "total_cost_usd": 0.0123, "usage": {"input_tokens": 50, "output_tokens": 20,
-                                                       "cache_creation_input_tokens": 5},
+                   # Like the real CLI, a resumed session reports its whole cost so far.
+                   "total_cost_usd": 0.0246 if "--resume" in args else 0.0123,
+                   "usage": {"input_tokens": 50, "output_tokens": 20, "cache_creation_input_tokens": 5},
+                   "modelUsage": {
+                       "claude-fake-9-9": {"inputTokens": 50, "outputTokens": 20, "cacheReadInputTokens": 7,
+                                           "cacheCreationInputTokens": 5, "webSearchRequests": 0, "costUSD": 0.0023,
+                                           "costBasis": "unknown" if mode == "unpriced" else "list"},
+                       "claude-helper-1-0": {"inputTokens": 100, "outputTokens": 10, "cacheReadInputTokens": 0,
+                                             "cacheCreationInputTokens": 0, "webSearchRequests": 2, "costUSD": 0.01,
+                                             "costBasis": "list"}},
                    "permission_denials": denials})
     for e in events:
         print(json.dumps(e), flush=True)

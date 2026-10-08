@@ -232,7 +232,8 @@ class TestEndToEnd(Sandbox):
         self.assertIn("+changed", text)
 
     def test_agy_research_ok_and_fetch_warning(self):
-        rc, out = self.crew("run", "--role", "research", "--cd", str(self.repo), "--task", "Latest X?", "--wait")
+        rc, out = self.crew("run", "--role", "research", "--agent", "google-fast", "--cd", str(self.repo),
+                            "--task", "Latest X?", "--wait")
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.result(out)["status"], "ok")
         text = (self.task_dir(out) / "task.md").read_text(encoding="utf-8")
@@ -261,7 +262,8 @@ class TestEndToEnd(Sandbox):
         self.assertIn("cannot build or test", out)
 
     def test_long_agy_task_passed_by_file(self):
-        rc, out = self.crew("run", "--role", "light", "--cd", str(self.repo), "--task", "y" * 20000, "--wait")
+        rc, out = self.crew("run", "--role", "light", "--agent", "google-fast", "--cd", str(self.repo),
+                            "--task", "y" * 20000, "--wait")
         self.assertEqual(rc, 0, out)
         argv = self.cmd(out)["argv"]
         self.assertIn(str(self.task_dir(out)), argv)
@@ -299,7 +301,7 @@ class TestEndToEnd(Sandbox):
         self.assertEqual(rc, 1)
 
     def test_status_and_stats(self):
-        self.crew("run", "--role", "light", "--cd", str(self.repo), "--task", "x", "--wait")
+        self.crew("run", "--role", "light", "--agent", "google-fast", "--cd", str(self.repo), "--task", "x", "--wait")
         rc, out = self.crew("status")
         self.assertIn("ok", out)
         rc, out = self.crew("stats")
@@ -340,6 +342,34 @@ class TestEndToEnd(Sandbox):
         self.assertEqual(json.loads((task / "result.json").read_text())["status"], "harness-error")
 
 
+class TestPreambleAndDefaults(unittest.TestCase):
+    def test_web_tasks_get_todays_date(self):
+        text = crew.scope_preamble("claude", {"access": "read", "web": True, "network": False}, Path("s"), None, False)
+        self.assertIn(f"Today's date is {crew.dt.date.today().isoformat()}", text)
+        text = crew.scope_preamble("claude", {"access": "read", "web": False, "network": False}, Path("s"), None, False)
+        self.assertNotIn("Today's date", text)
+
+    def test_write_tasks_must_report_checks(self):
+        text = crew.scope_preamble("codex", {"access": "write", "web": False, "network": False}, Path("s"), None, False)
+        self.assertIn("run the checks the task names", text)
+
+    def test_haiku_5_5_leads_the_fast_roles(self):
+        cfg = crew.read_json(crew.DEFAULT_CONFIG)
+        self.assertEqual(cfg["agents"]["claude-fast"], "claude:claude-haiku-5-5@medium")
+        for role in ("implement-light", "research", "light"):
+            self.assertEqual(cfg["roles"][role]["agent"][0], "claude-fast", role)
+        # Called from Claude, crew still hands these roles to another vendor.
+        installed = lambda c, b: [b]  # noqa: E731
+        saved, crew.backend_cmd = crew.backend_cmd, installed
+        try:
+            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="claude")
+            self.assertEqual(spec["backend"], "codex")
+            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="codex")
+            self.assertEqual(crew.spec_str(spec), "claude:claude-haiku-5-5@medium")
+        finally:
+            crew.backend_cmd = saved
+
+
 class TestClaude(Sandbox):
     def settings(self, out):
         return json.loads((self.task_dir(out) / "claude-settings.json").read_text(encoding="utf-8"))
@@ -371,7 +401,11 @@ class TestClaude(Sandbox):
         self.assertEqual(r["status"], "ok")
         self.assertEqual(r["session_id"], "11111111-1111-1111-1111-111111111111")
         self.assertAlmostEqual(r["cost_usd"], 0.0123)
-        self.assertEqual(r["tokens"], 75)
+        self.assertEqual(r["resolved_model"], "claude-fake-9-9")
+        self.assertEqual(r["tokens"], 185)  # the helper model's tokens count too; cache reads don't
+        self.assertEqual(r["model_usage"]["claude-helper-1-0"]["web_searches"], 2)
+        self.assertIsNone(r["cost_note"])
+        self.assertIn("(ran claude-fake-9-9)", out)
         answer = (self.task_dir(out) / "final.md").read_text(encoding="utf-8")
         self.assertIn('"CLAUDECODE": false', answer)      # caller marker stripped
         self.assertIn('"CREW_TASK_DIR": true', answer)    # nesting guard set
@@ -409,10 +443,41 @@ class TestClaude(Sandbox):
         rc, out = self.crew("run", "--role", "review", "--agent", "claude:opus", "--cd", str(self.repo), "--wait")
         self.assertEqual(rc, 0, out)
         self.assertIn("+changed", (self.task_dir(out) / "task.md").read_text(encoding="utf-8"))
-        rc, out = self.crew("run", "--resume", str(self.task_dir(out)), "--task", "and the tests?", "--wait")
+        first = self.task_dir(out)
+        rc, out = self.crew("run", "--resume", str(first), "--task", "and the tests?", "--wait",
+                            CLAUDE_CODE_SESSION_ID="caller-session-1")
         self.assertEqual(rc, 0, out)
-        argv = self.cmd(out)["argv"]
-        self.assertEqual(self.arg_after(argv, "--resume"), "11111111-1111-1111-1111-111111111111")
+        cmd = self.cmd(out)
+        self.assertEqual(self.arg_after(cmd["argv"], "--resume"), "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(cmd["resumed_from"], str(first))
+        self.assertEqual(cmd["caller_session"], "caller-session-1")
+        r = self.result(out)
+        self.assertAlmostEqual(r["session_cost_usd"], 0.0246)
+        self.assertAlmostEqual(r["cost_usd"], 0.0123)  # only this follow-up, not the session so far
+        rc, out = self.crew("stats")
+        line = next(l for l in out.splitlines() if l.startswith("claude:claude-fake-9-9"))
+        self.assertEqual(line.split()[1:3], ["2", "2"])
+        self.assertEqual(line.split()[-1], "0.02")
+
+    def test_unpriced_model_flagged(self):
+        rc, out = self.crew("run", "--role", "light", "--agent", "claude:claude-haiku-5-5", "--cd", str(self.repo),
+                            "--task", "x", "--wait", mode="unpriced")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("no price list for claude-fake-9-9", self.result(out)["cost_note"])
+        self.assertIn("update the claude CLI", out)
+
+    def test_legacy_resumed_cost_corrected_in_stats(self):
+        runs = self.home / "runs"
+        for name, cost, prev in (("a", 0.5, None), ("b", 0.8, "a"), ("c", 1.0, "b")):
+            (runs / name).mkdir(parents=True)
+            (runs / name / "cmd.json").write_text(json.dumps({"resumed_from": str(runs / prev) if prev else None}))
+        with open(self.home / "ledger.jsonl", "w", encoding="utf-8") as f:
+            for name, cost in (("a", 0.5), ("b", 0.8), ("c", 1.0)):
+                f.write(json.dumps({"backend": "claude", "model": "opus", "status": "ok", "seconds": 60,
+                                    "tokens": 10, "cost_usd": cost, "dir": name}) + "\n")
+        rc, out = self.crew("stats")
+        line = next(l for l in out.splitlines() if l.startswith("claude:opus"))
+        self.assertEqual(line.split()[-1], "1.00")  # 0.5 + 0.3 + 0.2, not 2.3
 
 
 class TestCaller(Sandbox):

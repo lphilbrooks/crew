@@ -1,5 +1,5 @@
 {
-  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed.",
+  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed. Claude agents use full model ids, because Claude Code's short aliases can lag a release (claude 2.1.286 still maps 'haiku' to Haiku 4.5).",
 
   "view": "auto",
   "hold": true,
@@ -25,10 +25,10 @@
     "codex-balanced": "codex:gpt-6.1-sol@medium",
     "codex-fast": "codex:gpt-6-luna@medium",
     "codex-frontier": "codex:gpt-6-astra@high",
-    "claude-strong": "claude:opus@high",
-    "claude-balanced": "claude:sonnet@high",
-    "claude-fast": "claude:haiku",
-    "claude-frontier": "claude:fable@high",
+    "claude-strong": "claude:claude-opus-5-5@high",
+    "claude-balanced": "claude:claude-sonnet-5-5@high",
+    "claude-fast": "claude:claude-haiku-5-5@medium",
+    "claude-frontier": "claude:claude-fable-5-1@high",
     "google-fast": "agy:gemini-3.8-flash-medium",
     "google-strong": "agy:gemini-3.1-pro-high"
   },
@@ -57,21 +57,21 @@
       "about": "Bounded implementation. Edits the working tree, never commits; the caller checks the result and commits."
     },
     "implement-light": {
-      "agent": ["codex-fast", "claude-fast"],
+      "agent": ["claude-fast", "codex-fast"],
       "access": "write",
       "web": false,
       "network": false,
       "about": "Cheap mechanical work: boilerplate, fixtures, test scaffolding, docs from code."
     },
     "research": {
-      "agent": ["google-fast", "codex-fast", "claude-fast"],
+      "agent": ["claude-fast", "codex-fast", "google-fast"],
       "access": "read",
       "web": true,
       "network": false,
       "about": "Web research and documentation lookups. Answers with sources."
     },
     "light": {
-      "agent": ["google-fast", "codex-fast", "claude-fast"],
+      "agent": ["claude-fast", "google-fast", "codex-fast"],
       "access": "read",
       "web": false,
       "network": false,
