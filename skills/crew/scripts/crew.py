@@ -765,7 +765,26 @@ def wait_for(task: Path, timeout: float) -> int:
             write_harness_result(task, f"runner never started within {STARTUP_GRACE_SEC}s (terminal or background launch failed)")
             break
         time.sleep(2)
+    try:
+        retried = read_json(result).get("retried_as")
+    except (OSError, ValueError):
+        retried = None
+    if retried and Path(retried).is_dir():
+        print(f"crew: {read_json(task / 'cmd.json').get('agent')} hit its usage limit; "
+              f"the task was sent on to another agent (run {Path(retried).name})")
+        return wait_for(Path(retried), max(timeout - (time.time() - begin), 60))
     return print_result(task)
+
+
+def wait_for_panel(panel: Path, timeout: float) -> int:
+    info = read_json(panel / "panel.json")
+    begin, codes = time.time(), []
+    for i, member in enumerate(info["members"], 1):
+        print(f"\n===== panel member {i} of {len(info['members'])}: {info['agents'][i - 1]} =====")
+        codes.append(wait_for(Path(member), max(timeout - (time.time() - begin), 60)))
+    print(f"\n===== panel {panel.name}: {sum(c == 0 for c in codes)} of {len(codes)} ok =====")
+    print("crew: compare the answers: where they disagree, check the claim yourself before using it.")
+    return 0 if all(c == 0 for c in codes) else (3 if 3 in codes else 2)
 
 
 def print_result(task: Path) -> int:
@@ -798,6 +817,10 @@ def print_result(task: Path) -> int:
         print("crew: touched files (relative to the repository root):")
         for p in r["touched_files"]:
             print(f"  {p}")
+    if r.get("checks"):
+        print("crew: fact check (crew fetched the cited URLs and package registries; details in checks.json):")
+        for line in summarize_checks(r["checks"]):
+            print(f"  {line}")
     print("----- final answer -----")
     final = task / "final.md"
     if final.exists() and final.read_text(encoding="utf-8", errors="replace").strip():
@@ -842,64 +865,145 @@ def resolve_caller(arg):
     return arg or detect_caller()
 
 
+REQUEST_KEYS = ("role", "agent", "model", "effort", "cd", "access", "web", "network", "target", "slug",
+                "max_minutes", "caller", "view", "hold", "timeout")
+
+
 def cmd_run(args) -> int:
     if os.environ.get(NESTED_MARKER):
         raise CrewError("crew is running inside a delegated task; delegated agents cannot delegate further.")
     cfg = load_config()
-    text = read_task_text(args)
-    caller = resolve_caller(args.caller)
-    choice_note = None
-    session = None
-    prior_cost = None
     if args.resume:
-        prev = Path(args.resume).expanduser().resolve()
+        return run_resume(cfg, args)
+    excluded = []
+    retry_of = None
+    if args.retry_of:
+        # Re-send a task whose agent hit its usage limit, to the next eligible agent.
+        retry_of = Path(args.retry_of).expanduser().resolve()
         try:
-            pc, pr = read_json(prev / "cmd.json"), read_json(prev / "result.json")
-        except (OSError, ValueError):
-            raise CrewError(f"{prev} is not a finished crew task directory")
-        if pc.get("backend") not in ("codex", "claude"):
-            raise CrewError("--resume works for codex and claude tasks only")
-        session = pr.get("session_id")
-        if not session:
-            raise CrewError(f"No session id recorded in {prev / 'result.json'}")
-        if not text:
-            raise CrewError("--resume needs the follow-up instructions (--task or --task-file)")
-        # Results written before session_cost_usd existed stored the session total in cost_usd.
-        prior_cost = pr.get("session_cost_usd", pr.get("cost_usd"))
-        role, cwd, scope = pc["role"], Path(pc["cwd"]), pc["scope"]
-        spec = parse_spec(pc["agent"])
-        exe = backend_cmd(cfg, spec["backend"])
-        if not exe:
-            raise CrewError(f"{spec['backend']} is not installed (or backends.{spec['backend']}.exe is wrong)")
-        role_cfg = (cfg.get("roles") or {}).get(role) or {}
+            prev = read_json(retry_of / "cmd.json")
+            req = prev["request"]
+            text = (retry_of / "request.md").read_text(encoding="utf-8")
+        except (OSError, ValueError, KeyError):
+            raise CrewError(f"{retry_of} has no stored request to retry")
+        for key in REQUEST_KEYS:
+            setattr(args, key, req.get(key))
+        args.caller = req.get("caller") or "none"
+        excluded = list(req.get("excluded") or []) + [prev["backend"]]
     else:
-        if not args.role:
-            raise CrewError("--role is required (or --resume <taskdir>)")
-        roles = cfg.get("roles") or {}
-        role = args.role
-        role_cfg = roles.get(role)
-        if role_cfg is None:
-            raise CrewError(f"Unknown role '{role}'. Known: {', '.join(roles)}. Add one with `crew.py set-role`.")
-        spec, exe, choice_note = choose_agent(cfg, args.agent or role_cfg.get("agent"), caller, explicit=bool(args.agent))
-        spec = dict(spec)
-        if args.model:
-            spec["model"] = args.model
-        cwd = Path(args.cd).expanduser().resolve()
-        if not cwd.is_dir():
-            raise CrewError(f"--cd {cwd} is not a directory")
-        access = args.access or role_cfg.get("access", "read")
-        if access not in ACCESS_LEVELS:
-            raise CrewError(f"Bad access '{access}' ({' | '.join(ACCESS_LEVELS)})")
-        scope = {"access": access,
-                 "web": role_cfg.get("web", False) if args.web is None else args.web,
-                 "network": role_cfg.get("network", False) if args.network is None else args.network}
+        text = read_task_text(args)
+    caller = resolve_caller(args.caller)
+    if not args.role:
+        raise CrewError("--role is required (or --resume <taskdir>)")
+    roles = cfg.get("roles") or {}
+    role_cfg = roles.get(args.role)
+    if role_cfg is None:
+        raise CrewError(f"Unknown role '{args.role}'. Known: {', '.join(roles)}. Add one with `crew.py set-role`.")
+    cwd = Path(args.cd).expanduser().resolve()
+    if not cwd.is_dir():
+        raise CrewError(f"--cd {cwd} is not a directory")
+    access = args.access or role_cfg.get("access", "read")
+    if access not in ACCESS_LEVELS:
+        raise CrewError(f"Bad access '{access}' ({' | '.join(ACCESS_LEVELS)})")
+    scope = {"access": access,
+             "web": role_cfg.get("web", False) if args.web is None else args.web,
+             "network": role_cfg.get("network", False) if args.network is None else args.network}
+    request = {key: getattr(args, key, None) for key in REQUEST_KEYS}
+    request.update(cd=str(cwd), caller=caller, excluded=excluded)
+
+    if args.agent:  # an explicit choice is always honoured, so it is never retried elsewhere
+        options = [choose_agent(cfg, args.agent, caller, explicit=True)]
+    else:
+        options = [o for o in candidates_for(cfg, role_cfg.get("agent"), caller, balance=bool(role_cfg.get("balance")))
+                   if o[0]["backend"] not in excluded]
+        if not options:
+            raise CrewError(f"no eligible agent for role '{args.role}' outside {', '.join(excluded)}")
+
+    if args.panel:
+        return run_panel(cfg, args, role_cfg, options, cwd, scope, text, caller, request)
+    spec, exe, note = options[0]
+    request["retry"] = not args.agent and len(options) > 1
+    task = launch_task(cfg, args, args.role, role_cfg, spec, exe, cwd, scope, text, caller, note,
+                       extra={"request": request, "retry_of": str(retry_of) if retry_of else None})
+    if args.wait:
+        return wait_for(task, args.timeout)
+    return 0
+
+
+def run_resume(cfg, args) -> int:
+    text = read_task_text(args)
+    prev = Path(args.resume).expanduser().resolve()
+    try:
+        pc, pr = read_json(prev / "cmd.json"), read_json(prev / "result.json")
+    except (OSError, ValueError):
+        raise CrewError(f"{prev} is not a finished crew task directory")
+    if pc.get("backend") not in ("codex", "claude"):
+        raise CrewError("--resume works for codex and claude tasks only")
+    session = pr.get("session_id")
+    if not session:
+        raise CrewError(f"No session id recorded in {prev / 'result.json'}")
+    if not text:
+        raise CrewError("--resume needs the follow-up instructions (--task or --task-file)")
+    spec = parse_spec(pc["agent"])
+    exe = backend_cmd(cfg, spec["backend"])
+    if not exe:
+        raise CrewError(f"{spec['backend']} is not installed (or backends.{spec['backend']}.exe is wrong)")
+    role = pc["role"]
+    role_cfg = (cfg.get("roles") or {}).get(role) or {}
+    # Results written before session_cost_usd existed stored the session total in cost_usd.
+    prior_cost = pr.get("session_cost_usd", pr.get("cost_usd"))
+    task = launch_task(cfg, args, role, role_cfg, spec, exe, Path(pc["cwd"]), pc["scope"], text,
+                       resolve_caller(args.caller), None, session=session,
+                       extra={"resumed_from": str(prev), "prior_session_cost_usd": prior_cost})
+    if args.wait:
+        return wait_for(task, args.timeout)
+    return 0
+
+
+def run_panel(cfg, args, role_cfg, options, cwd, scope, text, caller, request) -> int:
+    """The same task to several agents from different model families at once, for comparison."""
+    members, families = [], set()
+    for spec, exe, note in options:
+        family = model_family(spec)
+        if family not in families:
+            families.add(family)
+            members.append((spec, exe, note))
+        if len(members) == args.panel:
+            break
+    if len(members) < 2:
+        raise CrewError(f"a panel needs agents from at least two model families; role '{args.role}' has "
+                        f"{len(members)} eligible (see `crew.py roles --caller {caller or 'none'}`)")
+    if len(members) < args.panel:
+        print(f"crew: only {len(members)} model families are available for this panel")
+    panel = new_task_dir("panel", args.slug or cwd.name)
+    request = dict(request, retry=False)  # a retry could land on a family already in the panel
+    tasks = [launch_task(cfg, args, args.role, role_cfg, spec, exe, cwd, scope, text, caller, note,
+                         extra={"request": request, "panel": str(panel)})
+             for spec, exe, note in members]
+    write_json(panel / "panel.json", {"role": args.role, "members": [str(t) for t in tasks],
+                                      "agents": [spec_str(s) for s, _, _ in members], "created": now_iso()})
+    (panel / "request.md").write_text(text, encoding="utf-8")
+    print(f"crew: panel={panel}")
+    if args.wait:
+        return wait_for_panel(panel, args.timeout)
+    return 0
+
+
+def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, choice_note,
+                session=None, extra=None) -> Path:
+    """Write the task folder and start its runner. `text` is the caller's own request; the scope
+    note, role text and (for reviews) the diff are added here because they depend on the backend."""
+    spec = dict(spec)
+    if args.model and not session:
+        spec["model"] = args.model
+    request_text = text
     backend = spec["backend"]
     effort = args.effort or spec.get("effort") or role_cfg.get("effort")
     top = git_top(cwd)
     agy_fetch = backend == "agy" and scope["web"] and agy_fetch_allowed(cfg)
     enf = enforcement(backend, scope, bool(top), agy_fetch)
 
-    is_review = role_cfg.get("mode") == "review" and not args.resume
+    is_review = role_cfg.get("mode") == "review" and not session
     builtin_review = is_review and backend == "codex" and not text
     if is_review:
         if not top:
@@ -914,15 +1018,16 @@ def cmd_run(args) -> int:
     scratch.mkdir()
     if builtin_review:
         sent = f"(built-in codex review of target: {args.target}; no prompt is sent)"
-    elif args.resume:
+    elif session:
         sent = text  # the session already holds the original scope and instructions
     else:
         parts = [scope_preamble(backend, scope, scratch, top, agy_fetch), role_cfg.get("preamble") or "", text]
         sent = "\n\n".join(p for p in parts if p)
     (task / "task.md").write_text(sent, encoding="utf-8")
+    (task / "request.md").write_text(request_text, encoding="utf-8")
 
     if backend == "codex":
-        mode = "resume" if args.resume else ("builtin-review" if builtin_review else "exec")
+        mode = "resume" if session else ("builtin-review" if builtin_review else "exec")
         argv = exe + codex_args(cfg, spec, effort, scope, task, cwd, mode, args.target, session)
         use_stdin = not builtin_review
     elif backend == "claude":
@@ -947,17 +1052,19 @@ def cmd_run(args) -> int:
             allowed.append(rel.rstrip("/") + "/" if p.endswith("/") else rel)
     max_minutes = args.max_minutes or role_cfg.get("max_minutes") or cfg.get("max_minutes") or 60
     agent_label = spec_str(dict(spec, effort=effort))
-
-    write_json(task / "cmd.json", {
-        "role": role, "agent": agent_label, "backend": backend, "model": spec["model"], "effort": effort,
-        "caller": caller, "caller_session": caller_session(), "scope": scope, "enforcement": enf,
-        "cwd": str(cwd), "git_top": top, "argv": argv, "stdin": use_stdin, "env": env, "allowed_paths": allowed,
-        "max_minutes": max_minutes, "resumed_from": str(prev) if args.resume else None,
-        "prior_session_cost_usd": prior_cost, "created": now_iso()})
-
-    runner = [sys.executable, "-u", str(Path(__file__).resolve()), "_run", "--dir", str(task)]
     view = args.view or cfg.get("view", "auto")
     hold = cfg.get("hold", True) if args.hold is None else args.hold
+
+    cmd = {"role": role, "agent": agent_label, "backend": backend, "model": spec["model"], "effort": effort,
+           "family": model_family(spec), "caller": caller, "caller_session": caller_session(), "scope": scope,
+           "enforcement": enf, "cwd": str(cwd), "git_top": top, "argv": argv, "stdin": use_stdin, "env": env,
+           "allowed_paths": allowed, "max_minutes": max_minutes, "resumed_from": None,
+           "prior_session_cost_usd": None, "fact_check": bool(scope["web"] and cfg.get("fact_check", True)),
+           "view": view, "hold": hold, "created": now_iso()}
+    cmd.update(extra or {})
+    write_json(task / "cmd.json", cmd)
+
+    runner = [sys.executable, "-u", str(Path(__file__).resolve()), "_run", "--dir", str(task)]
     how = None
     if view in ("auto", "tab"):
         how = launch_tab(runner + (["--hold"] if hold else []), f"crew {role} {slugify(args.slug or cwd.name)}", task, cfg)
@@ -978,16 +1085,52 @@ def cmd_run(args) -> int:
     for dim, how_enforced in enf.items():
         print(f"crew:   {dim}: {how_enforced}")
     print(f"crew: dir={task}")
-    if args.wait:
-        return wait_for(task, args.timeout)
-    return 0
+    return task
 
 
 def cmd_collect(args) -> int:
     task = Path(args.dir).expanduser().resolve()
+    if (task / "panel.json").exists():
+        return wait_for_panel(task, args.timeout)
     if not (task / "cmd.json").exists():
         raise CrewError(f"{task} is not a crew task directory")
     return wait_for(task, args.timeout)
+
+
+def cmd_check(args) -> int:
+    task = Path(args.dir).expanduser().resolve()
+    if not (task / "final.md").exists():
+        raise CrewError(f"{task} has no final.md to check")
+    summary = fact_check(task)
+    try:
+        r = read_json(task / "result.json")
+        r["checks"] = summary
+        write_json(task / "result.json", r)
+    except (OSError, ValueError):
+        pass
+    for line in summarize_checks(summary):
+        print(line)
+    print(f"crew: details in {task / 'checks.json'}")
+    return 0 if not summary.get("urls_failed") and not summary.get("packages") and not summary.get("error") else 2
+
+
+def cmd_quota(args) -> int:
+    state = read_quota()
+    if not state:
+        print("crew: no usage-limit data yet (claude and codex runs report it; agy does not)")
+        return 0
+    now = time.time()
+    for backend, entry in sorted(state.items()):
+        score = quota_score(entry, now)
+        line = f"{backend:<8} {'?' if score is None else f'{score:.0%} used'}"
+        if (entry.get("limited_until") or 0) > now:
+            line += f"  LIMITED until {dt.datetime.fromtimestamp(entry['limited_until']):%H:%M %d %b}"
+        for name, w in (entry.get("windows") or {}).items():
+            live = not w.get("resets_at") or w["resets_at"] > now
+            when = f", resets {dt.datetime.fromtimestamp(w['resets_at']):%H:%M %d %b}" if w.get("resets_at") else ""
+            line += f"  | {name} {w.get('used', 0):.0%}{when}" if live else f"  | {name} reset"
+        print(line + f"  (seen {entry.get('updated')})")
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -1317,6 +1460,7 @@ class View:
         self.resolved_model = None  # the model the backend reports it ran, when it says
         self.model_usage = None  # per-model tokens and cost, including hidden helper models
         self.cost_note = None  # set when the reported cost can't be trusted
+        self.quota = None  # usage-limit windows the backend reported, if it reports them
 
     def show(self, text: str, style=None) -> None:
         out = f"\x1b[{COLOURS[style]}m{text}\x1b[0m" if style and self.colour else text
@@ -1446,7 +1590,9 @@ class ClaudeView(JsonView):
 
     def event(self, e: dict) -> None:
         kind = e.get("type")
-        if kind == "system" and e.get("subtype") == "init":
+        if kind == "rate_limit_event":
+            self.quota = claude_quota_windows(e) or self.quota
+        elif kind == "system" and e.get("subtype") == "init":
             self.session = e.get("session_id") or self.session
             self.resolved_model = e.get("model") or self.resolved_model
             self.show(f"session {self.session}  model {e.get('model')}  tools {','.join(e.get('tools') or [])}", "dim")
@@ -1590,6 +1736,22 @@ SESSION_VAR_RE = re.compile(
     r"|CODEX_(SESSION_ID|THREAD_ID|CI|SANDBOX\w*|VERSION))$")
 
 
+def retry_elsewhere(task: Path):
+    """Send a task whose agent hit its usage limit to the next eligible agent, as a new run.
+    Returns (new run folder or None, note)."""
+    try:
+        r = subprocess.run([sys.executable, str(Path(__file__).resolve()), "run", "--retry-of", str(task)],
+                           capture_output=True, timeout=120, env=agent_env({}))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"could not retry elsewhere: {e}"
+    out = (r.stdout + r.stderr).decode("utf-8", "replace")
+    found = re.search(r"^crew: dir=(.+)$", out, re.M)
+    if r.returncode != 0 or not found:
+        return None, "not retried: " + short(out.replace("crew: error: ", ""), 200)
+    agent = re.search(r"^crew: launched \S+ -> (\S+)", out, re.M)
+    return found[1].strip(), f"retried on {agent[1] if agent else 'another agent'} (run {Path(found[1].strip()).name})"
+
+
 def agent_env(cmd: dict) -> dict:
     env = {k: v for k, v in os.environ.items() if not SESSION_VAR_RE.match(k.upper())}
     env.update(cmd.get("env") or {})
@@ -1667,6 +1829,35 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         status = "scope-violation"
         note = (f"{len(violations)} file(s) changed outside what access={cmd['scope']['access']} allows. "
                 "If you edited the repo yourself during the run, those edits are included.")
+
+    backend = cmd["backend"]
+    quota = view.quota
+    if backend == "codex" and view.session:
+        quota = codex_quota_windows(view.session)
+    if quota:
+        record_quota(backend, quota, f"{backend} run {task.name}")
+    retried_as = None
+    tail = "\n".join([view.error or ""] + view.text[-30:])
+    hit_limit = any((w or {}).get("used", 0) >= 1 for w in (quota or {}).values())
+    if status in ("agent-error", "empty") and (looks_rate_limited(tail) or hit_limit):
+        status = "limited"
+        resets = limit_reset_from_text(tail) or max(
+            [w["resets_at"] for w in (quota or {}).values() if (w or {}).get("used", 0) >= 1 and w.get("resets_at")],
+            default=None)
+        record_limit(backend, resets, load_config().get("limit_cooldown_minutes", 60))
+        note = f"{backend} hit its usage limit" + (f" (resets {dt.datetime.fromtimestamp(resets):%H:%M %d %b})"
+                                                   if resets else "") + (f": {note}" if note else "")
+        if (cmd.get("request") or {}).get("retry"):
+            retried_as, retry_note = retry_elsewhere(task)
+            note += f"; {retry_note}"
+            view.show(f"crew: {retry_note}", "yellow")
+
+    checks = None
+    if status == "ok" and cmd.get("fact_check"):
+        view.show("crew: fact-checking the cited URLs and package versions...", "dim")
+        checks = fact_check(task)
+        for line in summarize_checks(checks):
+            view.show(f"  {line}", "yellow" if "fail" in line or "not" in line or "latest is" in line else "dim")
     seconds = round(time.time() - started, 1)
     session_cost = view.cost
     cost = session_cost
@@ -1678,13 +1869,15 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
               "scope": cmd["scope"], "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
               "session_cost_usd": session_cost, "cost_note": view.cost_note, "model_usage": view.model_usage,
               "session_id": view.session, "touched_files": touched, "violations": violations,
-              "denied_tools": view.denied, "final": str(final), "finished": now_iso()}
+              "denied_tools": view.denied, "quota": quota, "checks": checks, "retried_as": retried_as,
+              "final": str(final), "finished": now_iso()}
     write_json(task / "result.json", result)
     append_line(LEDGER, json.dumps({
         "ts": now_iso(), "role": cmd["role"], "backend": cmd["backend"], "model": cmd["model"],
         "resolved_model": resolved, "caller": cmd.get("caller"), "caller_session": cmd.get("caller_session"),
         "status": status, "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
-        "cost_reliable": view.cost_note is None, "resumed_from": cmd.get("resumed_from"), "dir": task.name}))
+        "cost_reliable": view.cost_note is None, "resumed_from": cmd.get("resumed_from"),
+        "retry_of": cmd.get("retry_of"), "panel": cmd.get("panel"), "dir": task.name}))
     colour, reset = ("\x1b[32m" if status == "ok" else "\x1b[31m", "\x1b[0m") if view.colour else ("", "")
     print("-" * 72)
     print(f"{colour}crew  {status}  exit={rc}  {seconds}s"
@@ -1723,7 +1916,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-minutes", type=float, help="kill the agent after this long")
     r.add_argument("--wait", action="store_true", help="block until done, then print the final answer")
     r.add_argument("--timeout", type=float, default=3600, help="seconds --wait waits (default 3600)")
+    r.add_argument("--panel", type=int, nargs="?", const=2, default=None, metavar="N",
+                   help="send the task to N agents (default 2) from different model families at once")
+    r.add_argument("--retry-of", help=argparse.SUPPRESS)  # internal: the runner's retry after a usage limit
     r.set_defaults(func=cmd_run)
+
+    ck = sub.add_parser("check", help="fact-check a finished run: cited URLs and package versions")
+    ck.add_argument("dir")
+    ck.set_defaults(func=cmd_check)
+    sub.add_parser("quota", help="usage-limit state crew has seen for each backend").set_defaults(func=cmd_quota)
 
     c = sub.add_parser("collect", help="wait for / reprint a task")
     c.add_argument("dir")

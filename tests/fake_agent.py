@@ -1,7 +1,7 @@
 """Stand-in for the codex and agy CLIs, so tests exercise crew end to end without a vendor.
 
 Usage: fake_agent.py codex|agy <real CLI arguments...>
-Behaviour switches (environment): FAKE_MODE = ok | fail | touch | deny | sleep | silent | unpriced
+Behaviour switches (environment): FAKE_MODE = ok | fail | touch | deny | sleep | silent | unpriced | limited
 """
 import json
 import os
@@ -10,6 +10,9 @@ import time
 
 kind, args = sys.argv[1], sys.argv[2:]
 mode = os.environ.get("FAKE_MODE", "ok")
+# FAKE_LIMITED=codex,claude makes those backends report a usage limit, so retries can be tested.
+if kind in os.environ.get("FAKE_LIMITED", "").split(","):
+    mode = "limited"
 
 if "--version" in args:
     print(f"fake-{kind} 1.0.0")
@@ -20,6 +23,16 @@ if mode == "sleep":
 if mode == "touch":
     with open("touched-by-agent.txt", "w") as f:
         f.write("x")
+
+if kind == "codex" and mode == "limited":
+    print(json.dumps({"type": "thread.started", "thread_id": "00000000-0000-0000-0000-00000000000f"}))
+    print(json.dumps({"type": "error", "message": "You've hit your usage limit. Try again later."}))
+    sys.exit(1)
+
+if kind == "claude" and mode == "limited":
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                      "result": "Claude AI usage limit reached|4102444800", "session_id": "l"}))
+    sys.exit(1)
 
 if kind == "codex":
     prompt = sys.stdin.read() if args and args[-1] == "-" else ""
@@ -45,11 +58,14 @@ if kind == "codex":
 if kind == "claude":
     prompt = sys.stdin.read()
     env_seen = {k: bool(os.environ.get(k)) for k in ("CLAUDECODE", "CREW_TASK_DIR")}
-    answer = f"fake claude answer; argv={json.dumps(args)}; prompt_chars={len(prompt)}; env={json.dumps(env_seen)}"
+    answer = os.environ.get("FAKE_ANSWER") or f"fake claude answer; argv={json.dumps(args)}; prompt_chars={len(prompt)}; env={json.dumps(env_seen)}"
     denials = [{"tool_name": "Bash", "tool_input": {"command": "rm -rf x"}}] if mode == "deny" else []
     events = [
         {"type": "system", "subtype": "init", "session_id": "11111111-1111-1111-1111-111111111111",
          "model": "claude-fake-9-9", "tools": ["Read"]},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": 0.25, "resetsAt": 4102444800},
+            "seven_day": {"utilization": 0.5, "resetsAt": 4102444800}}}},
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read",
                                                        "input": {"file_path": "a.txt"}}]}},
         {"type": "user", "message": {"content": [{"type": "tool_result", "content": "one"}]}},

@@ -51,7 +51,7 @@ class Sandbox(unittest.TestCase):
         self.env = dict(os.environ, CREW_HOME=str(self.home), CREW_CONFIG=str(self.home / "config.json"),
                         CREW_CALLER="none", CLAUDECODE="1")
         self.env.pop("CREW_TASK_DIR", None)
-        self.env.pop("CODEX_HOME", None)
+        self.env["CODEX_HOME"] = str(base / "codex-home")  # keep the real codex session logs out of tests
 
     def tearDown(self):
         # Tasks started without --wait may still be running in the repo. Let them finish, or
@@ -530,3 +530,110 @@ class TestCaller(Sandbox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSpreading(Sandbox):
+    """Usage-limit retries, quota recording, panels and the fact check, end to end."""
+
+    def set_role(self, name, agents, **extra):
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg.setdefault("roles", {})[name] = dict({"agent": agents, "access": "read"}, **extra)
+        (self.home / "config.json").write_text(json.dumps(cfg))
+
+    def quota(self):
+        return json.loads((self.home / "quota.json").read_text(encoding="utf-8"))
+
+    def test_limit_retries_on_next_agent(self):
+        self.set_role("pair", ["codex:m1", "claude:m2"])
+        rc, out = self.crew("run", "--role", "pair", "--cd", str(self.repo), "--task", "x", "--wait",
+                            FAKE_LIMITED="codex")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("hit its usage limit", out)
+        second = self.task_dir(out)
+        cmd = json.loads((second / "cmd.json").read_text(encoding="utf-8"))
+        self.assertEqual(cmd["backend"], "claude")
+        first = Path(cmd["retry_of"])
+        r1 = json.loads((first / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(r1["status"], "limited")
+        self.assertEqual(Path(r1["retried_as"]), second)
+        self.assertGreater(self.quota()["codex"]["limited_until"], 0)
+        self.assertEqual(self.quota()["claude"]["windows"]["five_hour"]["used"], 0.25)
+
+    def test_explicit_agent_is_not_retried(self):
+        rc, out = self.crew("run", "--role", "light", "--agent", "codex:m1", "--cd", str(self.repo), "--task", "x",
+                            "--wait", FAKE_LIMITED="codex")
+        self.assertEqual(rc, 2, out)
+        r = self.result(out)
+        self.assertEqual(r["status"], "limited")
+        self.assertIsNone(r["retried_as"])
+
+    def test_retry_chain_stops_when_everyone_is_limited(self):
+        self.set_role("pair", ["codex:m1", "claude:m2"])
+        rc, out = self.crew("run", "--role", "pair", "--cd", str(self.repo), "--task", "x", "--wait",
+                            FAKE_LIMITED="codex,claude")
+        self.assertEqual(rc, 2, out)
+        r = self.result(out)
+        self.assertEqual(r["status"], "limited")
+        self.assertIn("not retried", r["note"])
+        # the claude limit text carries its reset time, which crew keeps
+        self.assertEqual(self.quota()["claude"]["limited_until"], 4102444800)
+
+    def test_limited_backend_is_avoided_next_time(self):
+        self.set_role("pair", ["codex:m1", "claude:m2"])
+        self.crew("run", "--role", "pair", "--cd", str(self.repo), "--task", "x", "--wait", FAKE_LIMITED="codex")
+        rc, out = self.crew("run", "--role", "pair", "--cd", str(self.repo), "--task", "y", "--wait")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cmd(out)["backend"], "claude")
+        self.assertIn("LIMITED", self.crew("quota")[1])
+
+    def test_panel_uses_different_families(self):
+        self.set_role("trio", ["codex:m1", "codex:m2", "claude:m3", "agy:gemini-x"])
+        rc, out = self.crew("run", "--role", "trio", "--panel", "--cd", str(self.repo), "--task", "x", "--wait")
+        self.assertEqual(rc, 0, out)
+        panel = Path([l for l in out.splitlines() if l.startswith("crew: panel=")][0].split("=", 1)[1])
+        info = json.loads((panel / "panel.json").read_text(encoding="utf-8"))
+        self.assertEqual(info["agents"], ["codex:m1", "claude:m3"])
+        self.assertIn("2 of 2 ok", out)
+        rc, again = self.crew("collect", str(panel))
+        self.assertEqual(rc, 0, again)
+
+    def test_panel_needs_two_families(self):
+        self.set_role("solo", ["codex:m1", "codex:m2"])
+        rc, out = self.crew("run", "--role", "solo", "--panel", "--cd", str(self.repo), "--task", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("at least two model families", out)
+
+    def test_fact_check_after_web_run(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_response(200 if self.path == "/ok" else 404)
+                self.end_headers()
+            do_GET = do_HEAD
+
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{server.server_port}"
+            answer = f"See [good]({base}/ok) and [bad]({base}/gone)."
+            rc, out = self.crew("run", "--role", "light", "--agent", "claude:m", "--web", "--cd", str(self.repo),
+                                "--task", "x", "--wait", FAKE_ANSWER=answer, CREW_CHECK_ALLOW_LOCAL="1")
+            self.assertEqual(rc, 0, out)
+            self.assertIn("fact check", out)
+            checks = self.result(out)["checks"]
+            self.assertEqual(checks["urls_checked"], 2)
+            self.assertEqual([u["url"] for u in checks["urls_failed"]], [f"{base}/gone"])
+            rc, again = self.crew("check", str(self.task_dir(out)), CREW_CHECK_ALLOW_LOCAL="1")
+            self.assertEqual(rc, 2, again)
+        finally:
+            server.shutdown()
+
+    def test_no_fact_check_without_web(self):
+        rc, out = self.crew("run", "--role", "light", "--agent", "claude:m", "--no-web", "--cd", str(self.repo),
+                            "--task", "x", "--wait", FAKE_ANSWER="see https://example.invalid/x")
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self.result(out)["checks"])
