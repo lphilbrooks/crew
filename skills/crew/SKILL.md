@@ -15,7 +15,7 @@ compatibility: >-
   signed in, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.2.0"
+  version: "1.3.0"
 ---
 
 # crew

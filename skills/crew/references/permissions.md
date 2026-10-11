@@ -41,8 +41,20 @@ Each task gets `<run folder>/scratch`, exported as `CREW_SCRATCH`.
 - `verify` also sets `PYTHONDONTWRITEBYTECODE=1`, so `__pycache__` stays out of the repo.
 - Codex and Claude may write to it.
 
-Roles can add environment variables with `{cwd}`, `{scratch}` and `{task}` placeholders. For
-example, `"CARGO_TARGET_DIR": "{scratch}/target"` keeps a Rust build out of the repository.
+When the run finishes, crew removes build output from the scratch folder: directories named
+`target`, `node_modules`, `.venv`, `build`, `dist` and similar, wherever they are inside it. Small
+loose files (1 MB or less) at the top of a build folder are kept, because agents often save their
+evidence logs there (e.g. `target/test-run.log`). Links and junctions are removed as links and never
+followed. `result.json` records how much was freed (`scratch_pruned_bytes`). Set
+`"prune_scratch": false` to keep everything, and run `crew.py prune` to clean older runs.
+
+Roles can add environment variables with `{cwd}`, `{scratch}`, `{task}` and `{cache}` placeholders.
+`{cache}` is a build folder kept between runs, one per repository (`~/.crew/cache/<repo>-<hash>`).
+crew makes it writable for that role. For a Rust project, `"CARGO_TARGET_DIR": "{cache}/target"`
+keeps the build out of the repository, and each review reuses the last build instead of compiling
+from nothing (`{scratch}/target` works too, but every run then builds from scratch). Evidence that
+should stay with a run belongs in `$CREW_SCRATCH`, not the cache. `crew.py prune --cache` deletes
+the caches.
 
 ## Isolation
 

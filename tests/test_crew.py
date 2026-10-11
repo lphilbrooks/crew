@@ -661,3 +661,55 @@ class TestSpreading(Sandbox):
         self.set_role("pair", ["codex:m1", "claude:m2"], balance=True)
         rc, out = self.crew("run", "--role", "pair", "--cd", str(self.repo), "--task", "x", "--wait")
         self.assertEqual(rc, 0, out)
+
+
+
+class TestScratch(Sandbox):
+    def test_build_output_pruned_after_run(self):
+        rc, out = self.crew("run", "--role", "check", "--agent", "codex:m", "--cd", str(self.repo), "--task", "x",
+                            "--wait", mode="build")
+        self.assertEqual(rc, 0, out)
+        task = self.task_dir(out)
+        import time
+        for _ in range(60):  # pruning happens just after result.json is first written
+            r = self.result(out)
+            if "scratch_pruned_bytes" in r:
+                break
+            time.sleep(0.5)
+        self.assertEqual(r["scratch_pruned_bytes"], 300000)
+        self.assertFalse((task / "scratch" / "target" / "debug").exists())
+        self.assertTrue((task / "scratch" / "target" / "evidence.log").exists())
+
+    def test_prune_command_on_finished_runs(self):
+        self.write_cfg_prune(False)
+        rc, out = self.crew("run", "--role", "check", "--agent", "codex:m", "--cd", str(self.repo), "--task", "x",
+                            "--wait", mode="build")
+        task = self.task_dir(out)
+        self.assertTrue((task / "scratch" / "target" / "debug").exists())
+        rc, dry = self.crew("prune", "--dry-run")
+        self.assertIn("would remove about", dry)
+        self.assertTrue((task / "scratch" / "target" / "debug").exists())
+        rc, done = self.crew("prune")
+        self.assertEqual(rc, 0, done)
+        self.assertIn("removed", done)
+        self.assertFalse((task / "scratch" / "target" / "debug").exists())
+        self.assertTrue((task / "final.md").exists())
+
+    def write_cfg_prune(self, on):
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg["prune_scratch"] = on
+        (self.home / "config.json").write_text(json.dumps(cfg))
+
+    def test_cache_placeholder(self):
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg["roles"] = {"rust": {"agent": "codex:m", "access": "verify", "env": {"CARGO_TARGET_DIR": "{cache}/target"}}}
+        (self.home / "config.json").write_text(json.dumps(cfg))
+        rc, out = self.crew("run", "--role", "rust", "--cd", str(self.repo), "--task", "x", "--wait")
+        self.assertEqual(rc, 0, out)
+        cmd = self.cmd(out)
+        cache = Path(cmd["cache"])
+        self.assertEqual(cache.parent, self.home / "cache")
+        self.assertTrue(cache.is_dir())
+        self.assertEqual(Path(cmd["env"]["CARGO_TARGET_DIR"]), cache / "target")
+        roots = [a for a in cmd["argv"] if a.startswith("sandbox_workspace_write.writable_roots=")][0]
+        self.assertIn(json.dumps(str(cache))[1:-1], roots)

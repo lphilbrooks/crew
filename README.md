@@ -147,7 +147,9 @@ built so that a person can follow every step.
   versions that don't exist (or aren't the latest) are listed with the answer. This uses no
   model, only plain web requests. Turn it off with `"fact_check": false`.
 
-Run folders are never deleted automatically. Remove old ones whenever you like.
+Run folders are never deleted automatically, but build output is: when a run finishes, crew removes
+build folders (`target`, `node_modules` and the like) from its scratch folder and keeps everything
+else, including small evidence logs. `crew.py prune` does the same for older runs.
 
 ## Install
 
@@ -208,6 +210,7 @@ crew.py run --resume <run folder> --task "Use the helper in util.py instead" --w
 crew.py run --role research --task "Latest stable <library> version, with sources" --wait
 crew.py run --role research --panel --task "..." --wait     # same question to two model families
 crew.py check <run folder>                                  # re-run the fact check
+crew.py prune --dry-run                                     # build output older runs still hold
 crew.py status | stats | quota | collect <run folder> | roles | models | doctor
 ```
 
@@ -273,6 +276,8 @@ Other settings:
 | `hold` | keep tabs open after a task finishes |
 | `max_minutes` | kill runaway tasks (default 60) |
 | `fact_check` | check cited URLs and package versions after web tasks (default on) |
+| `prune_scratch` | remove build output from a run's scratch folder when it finishes (default on) |
+| `roles.<name>.env` | environment for that role's agents; `{cache}` is a build folder kept between runs, e.g. `"CARGO_TARGET_DIR": "{cache}/target"` |
 | `roles.<name>.balance` | prefer the vendor with the most usage left (on for `implement-light`, `light`) |
 | `limit_cooldown_minutes` | how long to avoid a vendor that hit its limit without saying when it resets (60) |
 | `terminal` | use your own terminal, e.g. `["kitty", "@", "launch", "{argv}"]` |
@@ -308,6 +313,7 @@ or when you want a per-task permission scope and a readable record of every prom
 | cost shows `?` | your claude CLI has no price for that model and guessed; update the claude CLI |
 | fact check says a site "could not be checked" | the site blocks automated requests; the link may be fine, so open it yourself |
 | old tabs pile up | finished tabs wait for Enter while `hold` is on; set `"hold": false`, or pass `--no-hold` |
+| `~/.crew/runs` is very large | runs from before 1.3 kept their build output; run `crew.py prune` |
 
 ## Development
 
@@ -320,6 +326,13 @@ macOS, and checks the skill against the
 [Agent Skills specification](https://agentskills.io/specification).
 
 ## Changes
+
+**1.3.0**
+- Build output is removed from a run's scratch folder when it finishes. Before this, every Rust
+  review kept a full build (2-8 GB each). Small evidence logs and the run record are kept.
+- `crew.py prune` cleans older runs; `--dry-run` reports first, `--cache` clears shared caches.
+- `{cache}` placeholder: a build folder per repository, kept between runs, so reviews can reuse
+  the last build.
 
 **1.2.0**
 - When an agent hits its vendor's usage limit, the task moves to the next agent in the role, and

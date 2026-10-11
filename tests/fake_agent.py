@@ -1,7 +1,7 @@
 """Stand-in for the codex and agy CLIs, so tests exercise crew end to end without a vendor.
 
 Usage: fake_agent.py codex|agy <real CLI arguments...>
-Behaviour switches (environment): FAKE_MODE = ok | fail | touch | deny | sleep | silent | unpriced | limited
+Behaviour switches (environment): FAKE_MODE = ok | fail | touch | deny | sleep | silent | unpriced | limited | build
 """
 import json
 import os
@@ -20,6 +20,13 @@ if "--version" in args:
 
 if mode == "sleep":
     time.sleep(600)
+if mode == "build" and os.environ.get("CREW_SCRATCH"):
+    target = os.path.join(os.environ["CREW_SCRATCH"], "target")
+    os.makedirs(os.path.join(target, "debug", "deps"), exist_ok=True)
+    with open(os.path.join(target, "debug", "deps", "big.rlib"), "wb") as f:
+        f.write(b"x" * 300000)
+    with open(os.path.join(target, "evidence.log"), "w") as f:
+        f.write("test result: ok")
 if mode == "touch":
     with open("touched-by-agent.txt", "w") as f:
         f.write("x")

@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -736,7 +737,8 @@ def codex_windows_sandbox():
     return m[1] if m else None
 
 
-def codex_args(cfg, spec, effort, scope, task: Path, cwd: Path, mode: str, target=None, session=None) -> list:
+def codex_args(cfg, spec, effort, scope, task: Path, cwd: Path, mode: str, target=None, session=None,
+               extra_write=()) -> list:
     opts = ["--json", "--skip-git-repo-check", "-m", spec["model"], "-o", str(task / "final.md")]
     if ((cfg.get("backends") or {}).get("codex") or {}).get("ignore_user_config"):
         opts.append("--ignore-user-config")
@@ -751,7 +753,8 @@ def codex_args(cfg, spec, effort, scope, task: Path, cwd: Path, mode: str, targe
     sandbox = "read-only" if scope["access"] == "read" else "workspace-write"
     if sandbox == "workspace-write":
         opts += ["-c", f"sandbox_workspace_write.network_access={'true' if scope['network'] else 'false'}",
-                 "-c", f"sandbox_workspace_write.writable_roots=[{toml_str(task / 'scratch')}]"]
+                 "-c", "sandbox_workspace_write.writable_roots=["
+                       + ", ".join(toml_str(r) for r in [task / "scratch", *extra_write]) + "]"]
     if mode == "builtin-review":  # `exec review` has no -s or -C: sandbox via config, cwd via the process
         kind, ref = parse_target(target)
         flags = {"uncommitted": ["--uncommitted"], "commit": ["--commit", ref or ""], "base": ["--base", ref or ""]}[kind]
@@ -759,7 +762,8 @@ def codex_args(cfg, spec, effort, scope, task: Path, cwd: Path, mode: str, targe
     return ["exec"] + opts + ["-s", sandbox, "-C", str(cwd), "-"]
 
 
-def claude_args(cmd, spec, effort, scope, task: Path, top, cwd: Path, role_cfg: dict, session=None) -> list:
+def claude_args(cmd, spec, effort, scope, task: Path, top, cwd: Path, role_cfg: dict, session=None,
+                extra_write=()) -> list:
     """Scope -> an explicit tool list plus a per-task settings file (permissions and sandbox)."""
     access, web, net = scope["access"], scope["web"], scope["network"]
     scratch = task / "scratch"
@@ -775,7 +779,7 @@ def claude_args(cmd, spec, effort, scope, task: Path, top, cwd: Path, role_cfg: 
     settings = {"permissions": {"allow": allow}}
     if access != "read":
         if claude_has_sandbox():
-            fs = {"allowWrite": [str(scratch)]}
+            fs = {"allowWrite": [str(scratch)] + [str(p) for p in extra_write]}
             if access == "verify":
                 fs["denyWrite"] = [str(top or cwd)]
             domains = role_cfg.get("network_domains") or ["*"]
@@ -1268,12 +1272,17 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
     (task / "task.md").write_text(sent, encoding="utf-8")
     (task / "request.md").write_text(request_text, encoding="utf-8")
 
+    role_env = role_cfg.get("env") or {}
+    cache = shared_cache(top, cwd) if any("{cache}" in str(v) for v in role_env.values()) else None
+    extra_write = [cache] if cache and scope["access"] != "read" else []
+    for folder in extra_write:
+        folder.mkdir(parents=True, exist_ok=True)
     if backend == "codex":
         mode = "resume" if session else ("builtin-review" if builtin_review else "exec")
-        argv = exe + codex_args(cfg, spec, effort, scope, task, cwd, mode, args.target, session)
+        argv = exe + codex_args(cfg, spec, effort, scope, task, cwd, mode, args.target, session, extra_write)
         use_stdin = not builtin_review
     elif backend == "claude":
-        argv = exe + claude_args(exe, spec, effort, scope, task, top, cwd, role_cfg, session)
+        argv = exe + claude_args(exe, spec, effort, scope, task, top, cwd, role_cfg, session, extra_write)
         use_stdin = True
     else:
         argv = exe + agy_args(spec, effort, scope, task, cwd, sent)
@@ -1284,8 +1293,9 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
         env.update({"TMP": str(scratch), "TEMP": str(scratch), "TMPDIR": str(scratch)})
     if scope["access"] == "verify":
         env["PYTHONDONTWRITEBYTECODE"] = "1"  # keeps __pycache__ from tripping the violation check
-    for key, value in (role_cfg.get("env") or {}).items():
-        env[key] = str(value).replace("{cwd}", str(cwd)).replace("{scratch}", str(scratch)).replace("{task}", str(task))
+    for key, value in role_env.items():
+        env[key] = (str(value).replace("{cwd}", str(cwd)).replace("{scratch}", str(scratch))
+                    .replace("{task}", str(task)).replace("{cache}", str(cache)))
 
     allowed = []
     if top:
@@ -1302,6 +1312,7 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
            "enforcement": enf, "cwd": str(cwd), "git_top": top, "argv": argv, "stdin": use_stdin, "env": env,
            "allowed_paths": allowed, "max_minutes": max_minutes, "resumed_from": None,
            "prior_session_cost_usd": None, "fact_check": bool(scope["web"] and cfg.get("fact_check", True)),
+           "prune_scratch": bool(cfg.get("prune_scratch", True)), "cache": str(cache) if cache else None,
            "view": view, "hold": hold, "created": now_iso()}
     cmd.update(extra or {})
     write_json(task / "cmd.json", cmd)
@@ -1354,6 +1365,43 @@ def cmd_check(args) -> int:
         print(line)
     print(f"crew: details in {task / 'checks.json'}")
     return 0 if not summary.get("urls_failed") and not summary.get("packages") and not summary.get("error") else 2
+
+
+def cmd_prune(args) -> int:
+    """Remove build output from finished runs' scratch folders; the run records are kept."""
+    if args.cache:
+        cache = CREW_HOME / "cache"
+        if args.dry_run:
+            print(f"crew: would remove the shared build caches in {cache}")
+            return 0
+        freed, errors = _remove(str(cache)) if cache.exists() else (0, 0)
+        print(f"crew: removed {human_bytes(freed)} of shared build caches" + (f", {errors} error(s)" if errors else ""))
+        return 0 if not errors else 2
+    dirs = [Path(d).expanduser().resolve() for d in args.dirs] if args.dirs else \
+        sorted(d for d in RUNS_DIR.iterdir() if d.is_dir()) if RUNS_DIR.exists() else []
+    total = total_errors = 0
+    for task in dirs:
+        if not (task / "scratch").is_dir():
+            continue
+        if not (task / "result.json").exists():  # a finished runner may still hold its tab open; that's fine
+            print(f"  {task.name}: still running, skipped")
+            continue
+        if args.dry_run:
+            size = sum(os.path.getsize(os.path.join(r, f)) for r, ds, fs in os.walk(task / "scratch")
+                       if Path(r).name in BUILD_DIRS or any(part in BUILD_DIRS for part in Path(r).parts)
+                       for f in fs)
+            if size:
+                print(f"  {task.name}: about {human_bytes(size)} of build output")
+            total += size
+            continue
+        freed, errors = prune_scratch(task / "scratch")
+        if freed or errors:
+            print(f"  {task.name}: removed {human_bytes(freed)}" + (f", {errors} error(s)" if errors else ""))
+        total, total_errors = total + freed, total_errors + errors
+    verb = "would remove about" if args.dry_run else "removed"
+    print(f"crew: {verb} {human_bytes(total)} of build output; prompts, answers and logs are kept"
+          + (f" ({total_errors} item(s) could not be removed)" if total_errors else ""))
+    return 0 if not total_errors else 2
 
 
 def cmd_quota(args) -> int:
@@ -2015,6 +2063,100 @@ def summarize_checks(summary: dict) -> list:
     return lines
 
 
+# ------------------------------------------------------------------ scratch
+
+# Build output that agents put in a run's scratch folder. A Rust review builds the whole project
+# there from nothing, several GB a run, and nothing reads it once the run has finished.
+BUILD_DIRS = {"target", "node_modules", ".venv", "venv", "build", "dist", "__pycache__", ".pytest_cache",
+              ".mypy_cache", ".ruff_cache", ".gradle", ".tox", ".next", ".turbo", "obj"}
+KEEP_LOOSE_BYTES = 1024 * 1024  # small files at the top of a build folder are often an agent's evidence logs
+
+
+def _is_link(st) -> bool:
+    """Symlinks, and on Windows junctions too: removed as links, never followed."""
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
+def _remove(path: str):
+    """Delete a file or folder without following links. Returns (bytes freed, errors)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0, 0
+    try:
+        if _is_link(st):
+            try:
+                os.unlink(path)
+            except OSError:
+                os.rmdir(path)  # a directory link or junction: removes the link, not its target
+            return 0, 0
+        if stat.S_ISDIR(st.st_mode):
+            freed = errors = 0
+            with os.scandir(path) as entries:
+                children = [e.path for e in entries]
+            for child in children:
+                f, e = _remove(child)
+                freed, errors = freed + f, errors + e
+            os.rmdir(path)
+            return freed, errors
+        if not st.st_mode & stat.S_IWRITE:
+            os.chmod(path, stat.S_IWRITE)  # Windows refuses to delete read-only files (git objects)
+        os.unlink(path)
+        return st.st_size, 0
+    except OSError:
+        return 0, 1
+
+
+def prune_scratch(scratch: Path):
+    """Delete build output from a finished run's scratch folder, keeping small loose files at the
+    top of each build folder. Returns (bytes freed, errors)."""
+    freed = errors = 0
+    stack = [str(scratch)]
+    while stack:
+        folder = stack.pop()
+        try:
+            with os.scandir(folder) as entries:
+                children = list(entries)
+        except OSError:
+            continue
+        for entry in children:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if _is_link(st) or not stat.S_ISDIR(st.st_mode):
+                continue
+            if entry.name not in BUILD_DIRS:
+                stack.append(entry.path)
+                continue
+            with os.scandir(entry.path) as inner:
+                contents = list(inner)
+            for child in contents:
+                try:
+                    cst = child.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(cst.st_mode) and cst.st_size <= KEEP_LOOSE_BYTES:
+                    continue
+                f, e = _remove(child.path)
+                freed, errors = freed + f, errors + e
+    return freed, errors
+
+
+def shared_cache(top, cwd) -> Path:
+    """A build cache kept between runs, one per repository, for roles that opt in with {cache}."""
+    root = Path(top or cwd)
+    digest = hashlib.sha1(str(root).lower().encode("utf-8")).hexdigest()[:8]
+    return CREW_HOME / "cache" / f"{slugify(root.name)}-{digest}"
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
 # ------------------------------------------------------------------- runner
 
 COLOURS = {"dim": "90", "red": "31", "green": "32", "yellow": "33", "cyan": "36", "magenta": "35", "bold": "1"}
@@ -2481,8 +2623,15 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         "status": status, "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
         "cost_reliable": view.cost_note is None, "resumed_from": cmd.get("resumed_from"),
         "retry_of": cmd.get("retry_of"), "panel": cmd.get("panel"), "dir": task.name}))
+    if cmd.get("prune_scratch", True):
+        freed, errors = prune_scratch(task / "scratch")
+        if freed or errors:
+            result.update(scratch_pruned_bytes=freed, scratch_prune_errors=errors)
+            write_json(task / "result.json", result)
+            view.show(f"crew: removed {human_bytes(freed)} of build output from scratch"
+                      + (f" ({errors} item(s) could not be removed)" if errors else ""), "dim")
     view.raw.close()
-    colour, reset = ("\x1b[32m" if status == "ok" else "\x1b[31m", "\x1b[0m") if view.colour else ("", "")
+    colour, reset =("\x1b[32m" if status == "ok" else "\x1b[31m", "\x1b[0m") if view.colour else ("", "")
     print("-" * 72)
     print(f"{colour}crew  {status}  exit={rc}  {seconds}s"
           + (f"  tokens={view.tokens}" if view.tokens else "")
@@ -2529,6 +2678,11 @@ def build_parser() -> argparse.ArgumentParser:
     ck.add_argument("dir")
     ck.set_defaults(func=cmd_check)
     sub.add_parser("quota", help="usage-limit state crew has seen for each backend").set_defaults(func=cmd_quota)
+    pr = sub.add_parser("prune", help="remove build output from finished runs' scratch folders (records are kept)")
+    pr.add_argument("dirs", nargs="*", help="run folders (default: every finished run)")
+    pr.add_argument("--dry-run", action="store_true", help="only report what would be removed")
+    pr.add_argument("--cache", action="store_true", help="remove the shared per-repository build caches instead")
+    pr.set_defaults(func=cmd_prune)
 
     c = sub.add_parser("collect", help="wait for / reprint a task")
     c.add_argument("dir")

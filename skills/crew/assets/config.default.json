@@ -5,6 +5,7 @@
   "hold": true,
   "max_minutes": 60,
   "fact_check": true,
+  "prune_scratch": true,
   "terminal": null,
   "balance_step": 0.25,
   "unknown_quota": 0.5,
