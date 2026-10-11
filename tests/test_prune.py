@@ -95,6 +95,17 @@ class TestPruneScratch(unittest.TestCase):
         freed, errors = crew.prune_scratch(self.scratch)
         self.assertEqual((freed, errors), (50, 0))
 
+    def test_build_folders_found_by_their_cachedir_tag(self):
+        write(self.scratch / "probe-target" / "CACHEDIR.TAG", text="Signature: 8a477f597d28d172789f06886806bc55")
+        write(self.scratch / "probe-target" / "debug" / "deps" / "x.rlib", 4000)
+        write(self.scratch / "my-notes" / "debug" / "keep.txt", 4000)  # no tag, no build name: kept
+        self.assertEqual(crew.prune_scratch(self.scratch, dry_run=True), (4000, 0))
+        self.assertTrue((self.scratch / "probe-target" / "debug").exists())
+        self.assertEqual(crew.prune_scratch(self.scratch), (4000, 0))
+        self.assertFalse((self.scratch / "probe-target" / "debug").exists())
+        self.assertTrue((self.scratch / "probe-target" / "CACHEDIR.TAG").exists())
+        self.assertTrue((self.scratch / "my-notes" / "debug" / "keep.txt").exists())
+
     def test_missing_scratch_is_fine(self):
         self.assertEqual(crew.prune_scratch(self.scratch), (0, 0))
 

@@ -42,7 +42,9 @@ Each task gets `<run folder>/scratch`, exported as `CREW_SCRATCH`.
 - Codex and Claude may write to it.
 
 When the run finishes, crew removes build output from the scratch folder: directories named
-`target`, `node_modules`, `.venv`, `build`, `dist` and similar, wherever they are inside it. Small
+`target`, `node_modules`, `.venv`, `build`, `dist` and similar, and any directory carrying the
+standard `CACHEDIR.TAG` marker that Cargo and other build tools write (so `probe-target` or `tgt`
+count too), wherever they are inside it. Small
 loose files (1 MB or less) at the top of a build folder are kept, because agents often save their
 evidence logs there (e.g. `target/test-run.log`). Links and junctions are removed as links and never
 followed. `result.json` records how much was freed (`scratch_pruned_bytes`). Set

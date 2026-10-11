@@ -1386,15 +1386,12 @@ def cmd_prune(args) -> int:
         if not (task / "result.json").exists():  # a finished runner may still hold its tab open; that's fine
             print(f"  {task.name}: still running, skipped")
             continue
+        freed, errors = prune_scratch(task / "scratch", dry_run=args.dry_run)
         if args.dry_run:
-            size = sum(os.path.getsize(os.path.join(r, f)) for r, ds, fs in os.walk(task / "scratch")
-                       if Path(r).name in BUILD_DIRS or any(part in BUILD_DIRS for part in Path(r).parts)
-                       for f in fs)
-            if size:
-                print(f"  {task.name}: about {human_bytes(size)} of build output")
-            total += size
+            if freed:
+                print(f"  {task.name}: about {human_bytes(freed)} of build output")
+            total += freed
             continue
-        freed, errors = prune_scratch(task / "scratch")
         if freed or errors:
             print(f"  {task.name}: removed {human_bytes(freed)}" + (f", {errors} error(s)" if errors else ""))
         total, total_errors = total + freed, total_errors + errors
@@ -1430,6 +1427,12 @@ def cmd_status(args) -> int:
     dirs = sorted((d for d in RUNS_DIR.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True)[: args.last]
     for d in dirs:
         rp = d / "result.json"
+        if (d / "panel.json").exists():
+            try:
+                print(f"{d.name:<48} {'panel':<16} {len(read_json(d / 'panel.json').get('members') or [])} runs")
+            except (OSError, ValueError):
+                print(f"{d.name:<48} panel")
+            continue
         if rp.exists():
             r = read_json(rp)
             print(f"{d.name:<48} {str(r.get('status')):<16} {str(r.get('agent')):<32} {r.get('seconds')}s")
@@ -2077,14 +2080,17 @@ def _is_link(st) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
-def _remove(path: str):
-    """Delete a file or folder without following links. Returns (bytes freed, errors)."""
+def _remove(path: str, dry_run: bool = False):
+    """Delete a file or folder without following links. Returns (bytes freed, errors).
+    With dry_run, only adds up what would be freed."""
     try:
         st = os.lstat(path)
     except OSError:
         return 0, 0
     try:
         if _is_link(st):
+            if dry_run:
+                return 0, 0
             try:
                 os.unlink(path)
             except OSError:
@@ -2095,10 +2101,13 @@ def _remove(path: str):
             with os.scandir(path) as entries:
                 children = [e.path for e in entries]
             for child in children:
-                f, e = _remove(child)
+                f, e = _remove(child, dry_run)
                 freed, errors = freed + f, errors + e
-            os.rmdir(path)
+            if not dry_run:
+                os.rmdir(path)
             return freed, errors
+        if dry_run:
+            return st.st_size, 0
         if not st.st_mode & stat.S_IWRITE:
             os.chmod(path, stat.S_IWRITE)  # Windows refuses to delete read-only files (git objects)
         os.unlink(path)
@@ -2107,9 +2116,9 @@ def _remove(path: str):
         return 0, 1
 
 
-def prune_scratch(scratch: Path):
+def prune_scratch(scratch: Path, dry_run: bool = False):
     """Delete build output from a finished run's scratch folder, keeping small loose files at the
-    top of each build folder. Returns (bytes freed, errors)."""
+    top of each build folder. Returns (bytes freed, errors); with dry_run, nothing is deleted."""
     freed = errors = 0
     stack = [str(scratch)]
     while stack:
@@ -2126,7 +2135,9 @@ def prune_scratch(scratch: Path):
                 continue
             if _is_link(st) or not stat.S_ISDIR(st.st_mode):
                 continue
-            if entry.name not in BUILD_DIRS:
+            # Agents name their build folders freely (probe-target, tgt, target-ws...), but Cargo and
+            # other build tools mark every output folder with the standard CACHEDIR.TAG file.
+            if entry.name not in BUILD_DIRS and not os.path.isfile(os.path.join(entry.path, "CACHEDIR.TAG")):
                 stack.append(entry.path)
                 continue
             with os.scandir(entry.path) as inner:
@@ -2138,7 +2149,7 @@ def prune_scratch(scratch: Path):
                     continue
                 if stat.S_ISREG(cst.st_mode) and cst.st_size <= KEEP_LOOSE_BYTES:
                     continue
-                f, e = _remove(child.path)
+                f, e = _remove(child.path, dry_run)
                 freed, errors = freed + f, errors + e
     return freed, errors
 
