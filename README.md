@@ -244,7 +244,7 @@ Models live in config, not code.
 - The defaults are in [`assets/config.default.json`](skills/crew/assets/config.default.json).
 - Your overrides go in `~/.crew/config.json`.
 - An agent is written `backend:model@effort`, e.g. `codex:gpt-6.1-sol@high`,
-  `claude:claude-opus-5-5@high`, `agy:gemini-3.8-flash-medium`.
+  `claude:claude-opus-5-5@high`, `agy:gemini-3.8-flash-medium`, `agy:gemini-4-argon-high`.
 
 | Role | Tries, in order | Default scope |
 |---|---|---|
@@ -326,6 +326,11 @@ macOS, and checks the skill against the
 [Agent Skills specification](https://agentskills.io/specification).
 
 ## Changes
+
+**1.3.1**
+- `google-strong` is now Gemini 4 Argon (`agy:gemini-4-argon-high`, was Gemini 3.1 Pro), and
+  `google-balanced` (`agy:gemini-4-argon-medium`) is new. agy cannot run commands, so for a
+  Gemini review use `--agent google-strong --access read`.
 
 **1.3.0**
 - Build output is removed from a run's scratch folder when it finishes. Before this, every Rust

@@ -35,7 +35,8 @@
     "claude-fast": "claude:claude-haiku-5-5@medium",
     "claude-frontier": "claude:claude-fable-5-1@high",
     "google-fast": "agy:gemini-3.8-flash-medium",
-    "google-strong": "agy:gemini-3.1-pro-high"
+    "google-balanced": "agy:gemini-4-argon-medium",
+    "google-strong": "agy:gemini-4-argon-high"
   },
 
   "roles": {
