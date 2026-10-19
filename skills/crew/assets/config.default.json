@@ -1,5 +1,5 @@
 {
-  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed. Claude agents use full model ids, because Claude Code's short aliases can lag a release (claude 2.1.286 still maps 'haiku' to Haiku 4.5).",
+  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed. A role with \"other_family\": true refuses to run on the caller's own model family unless --agent names the agent. Claude agents use full model ids, because Claude Code's short aliases can lag a release (claude 2.1.286 still maps 'haiku' to Haiku 4.5).",
 
   "view": "auto",
   "hold": true,
@@ -41,6 +41,7 @@
   "roles": {
     "review": {
       "agent": ["codex-strong", "claude-strong"],
+      "other_family": true,
       "mode": "review",
       "access": "verify",
       "web": false,
@@ -49,6 +50,7 @@
     },
     "check": {
       "agent": ["codex-strong", "claude-strong"],
+      "other_family": true,
       "access": "verify",
       "web": false,
       "network": false,

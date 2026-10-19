@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import fnmatch
 import hashlib
 import ipaddress
 import json
@@ -47,9 +48,19 @@ HEARTBEAT_SEC = 5
 STALE_SEC = 30
 STARTUP_GRACE_SEC = 90
 TAB_CLAIM_SEC = 15
+STOP_WAIT_SEC = 30
+STOP_FILE = "stop"
+BRIEF_LINES = 40
+BRIEF_CHARS = 4000
 HASH_LIMIT = 64 * 1024 * 1024
 AGY_INLINE_LIMIT = 8000
 REVIEW_EMBED_LIMIT = 200_000
+UNTRACKED_EMBED_LIMIT = 100 * 1024
+# Untracked files a review never pastes into a prompt, matched against the lowercased file name.
+SECRET_NAMES = (".env", ".env.*", "*.env", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore",
+                "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", ".netrc", ".npmrc", ".pypirc", ".htpasswd",
+                "credentials", "*credentials*.json", "*secret*.json", "*secrets*.yaml", "*secrets*.yml",
+                "*.tfvars", "service-account*.json")
 AGY_FETCH_RULE = "read_url(*)"
 CLAUDE_ALIASES = ("fable", "opus", "sonnet", "haiku")
 
@@ -663,6 +674,86 @@ def changed_paths(before: dict, after: dict) -> list:
     return sorted(k for k in keys if before.get(k) != after.get(k))
 
 
+def _parse_time(text):
+    try:
+        return dt.datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def concurrent_writes(task: Path, top: str, start: float, end: float):
+    """Other crew write runs in the same repository whose run overlapped [start, end].
+    Returns (files the finished ones changed, names of those still running)."""
+    files, running = set(), []
+    if not RUNS_DIR.exists():
+        return files, running
+    oldest = dt.datetime.fromtimestamp(start - 86400).strftime("%Y%m%d-%H%M%S")
+    for other in RUNS_DIR.iterdir():
+        if other == task or not other.is_dir() or other.name[:15] < oldest:
+            continue
+        try:
+            oc = read_json(other / "cmd.json")
+        except (OSError, ValueError):
+            continue
+        if oc.get("git_top") != top or (oc.get("scope") or {}).get("access") != "write":
+            continue
+        created = _parse_time(oc.get("created"))
+        if created is None or created > end:
+            continue
+        try:
+            r = read_json(other / "result.json")
+        except (OSError, ValueError):
+            if runner_state(other) != "dead":
+                running.append(other.name)
+            continue
+        finished = _parse_time(r.get("finished"))
+        if finished is not None and finished >= start:
+            files.update(r.get("touched_files") or [])
+    return files, sorted(running)
+
+
+def concurrent_note(moved: list, running: list) -> str:
+    parts = []
+    if moved:
+        parts.append(f"{len(moved)} changed file(s) belong to crew write run(s) that ran at the same time "
+                     "(listed under concurrent_changes, not counted as violations)")
+    if running:
+        parts.append(f"crew write run(s) still running in this repository may account for the rest: "
+                     f"{', '.join(running)}; run `crew.py collect` on this run again once they finish")
+    return "; ".join(parts)
+
+
+def reattribute(task: Path) -> None:
+    """Re-check a scope violation once the concurrent write runs that might explain it have finished."""
+    try:
+        r, cmd = read_json(task / "result.json"), read_json(task / "cmd.json")
+    except (OSError, ValueError):
+        return
+    if r.get("status") != "scope-violation" or not r.get("concurrent_running"):
+        return
+    start = _parse_time(cmd.get("created"))
+    end = _parse_time(r.get("finished"))
+    if start is None or end is None:
+        return
+    files, running = concurrent_writes(task, cmd.get("git_top"), start, end)
+    moved = [p for p in r["violations"] if p in files]
+    r["violations"] = [p for p in r["violations"] if p not in files]
+    r["concurrent_changes"] = sorted(set(r.get("concurrent_changes") or []) | set(moved))
+    r["concurrent_running"] = running
+    if not r["violations"]:
+        r["status"] = r.get("base_status") or "ok"
+        r["note"] = r.get("base_note")
+        if r["status"] == "ok" and cmd.get("fact_check") and not r.get("checks"):
+            r["checks"] = fact_check(task)
+    else:
+        r["note"] = (f"{len(r['violations'])} file(s) changed outside what access={cmd['scope']['access']} allows. "
+                     "If you edited the repo yourself during the run, those edits are included.")
+        extra = concurrent_note(r["concurrent_changes"], running)
+        if extra:
+            r["note"] += f" {extra}."
+    write_json(task / "result.json", r)
+
+
 def git_text(top: str, *args: str) -> str:
     r = subprocess.run(["git", "-C", top, *args], capture_output=True, timeout=120)
     if r.returncode != 0:
@@ -689,12 +780,24 @@ def review_diff_text(top: str, target: str) -> str:
         return git_text(top, "diff", f"{ref}...HEAD")
     text = "$ git status --short\n" + git_text(top, "status", "--short") + "\n$ git diff HEAD\n" + git_text(top, "diff", "HEAD")
     for rel in git_text(top, "ls-files", "--others", "--exclude-standard").splitlines():
-        try:
-            content = (Path(top) / rel).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            content = "(unreadable or binary)"
+        path = Path(top) / rel
+        if looks_secret(rel):
+            content = "(not included: the name suggests it may hold secrets)"
+        elif path.is_file() and path.stat().st_size > UNTRACKED_EMBED_LIMIT:
+            content = f"(not included: larger than {UNTRACKED_EMBED_LIMIT // 1024} KB)"
+        else:
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                content = "(unreadable or binary)"
         text += f"\n--- untracked file: {rel}\n{content}"
     return text
+
+
+def looks_secret(rel: str) -> bool:
+    """Untracked files whose name suggests credentials. A review never sends their content."""
+    name = Path(rel).name.lower()
+    return any(fnmatch.fnmatch(name, pattern) for pattern in SECRET_NAMES)
 
 
 def review_task(extra: str, target: str, top: str, embed: bool, access: str) -> str:
@@ -703,10 +806,11 @@ def review_task(extra: str, target: str, top: str, embed: bool, access: str) -> 
         diff = review_diff_text(top, target)
         if len(diff) > REVIEW_EMBED_LIMIT:
             raise CrewError(f"The diff is {len(diff)} characters, too large to embed. "
-                            "Use an agent that can run git (codex, or claude with --access verify).")
+                            "Use an agent that can run git: codex, or claude with --access verify.")
         where = f"The change under review is below.\n<diff>\n{diff}\n</diff>"
     else:
-        how = {"uncommitted": "git status --short, git diff HEAD, and read any untracked files",
+        how = {"uncommitted": "git status --short, git diff HEAD, and read any untracked files (skip any whose "
+                              "name suggests secrets, such as .env files, keys or credentials)",
                "commit": f"git show {ref}",
                "base": f"git diff {ref}...HEAD"}[kind]
         where = f"Inspect the change under review with: {how} (read surrounding code as needed)."
@@ -966,9 +1070,9 @@ def runner_state(task: Path) -> str:
     return "alive" if pid_alive(int(info.get("pid", 0))) else "dead"
 
 
-def write_harness_result(task: Path, note: str, cmd=None, seconds=None) -> None:
+def write_harness_result(task: Path, note: str, cmd=None, seconds=None, status: str = "harness-error") -> None:
     try:
-        append_line(task / "raw.log", f"crew harness error: {note}")
+        append_line(task / "raw.log", f"crew {status.replace('-', ' ')}: {note}")
     except OSError:
         pass
     if cmd is None:
@@ -976,7 +1080,7 @@ def write_harness_result(task: Path, note: str, cmd=None, seconds=None) -> None:
             cmd = read_json(task / "cmd.json")
         except (OSError, ValueError):
             cmd = {}
-    result = {"status": "harness-error", "note": note, "exit": None, "role": cmd.get("role"),
+    result = {"status": status, "note": note, "exit": None, "role": cmd.get("role"),
               "agent": cmd.get("agent"), "backend": cmd.get("backend"), "model": cmd.get("model"),
               "scope": cmd.get("scope"), "seconds": seconds, "tokens": None, "cost_usd": None,
               "session_id": None, "touched_files": [], "violations": [], "denied_tools": [],
@@ -984,7 +1088,11 @@ def write_harness_result(task: Path, note: str, cmd=None, seconds=None) -> None:
     write_json(task / "result.json", result)
 
 
-def wait_for(task: Path, timeout: float) -> int:
+def write_cancelled_result(task: Path, note: str) -> None:
+    write_harness_result(task, note, status="cancelled")
+
+
+def wait_for(task: Path, timeout: float, brief: bool = False) -> int:
     result = task / "result.json"
     begin = time.time()
     try:
@@ -1013,23 +1121,24 @@ def wait_for(task: Path, timeout: float) -> int:
     if retried and Path(retried).is_dir():
         print(f"crew: {read_json(task / 'cmd.json').get('agent')} hit its usage limit; "
               f"the task was sent on to another agent (run {Path(retried).name})")
-        return wait_for(Path(retried), max(timeout - (time.time() - begin), 60))
-    return print_result(task)
+        return wait_for(Path(retried), max(timeout - (time.time() - begin), 60), brief)
+    return print_result(task, brief)
 
 
-def wait_for_panel(panel: Path, timeout: float) -> int:
+def wait_for_panel(panel: Path, timeout: float, brief: bool = False) -> int:
     info = read_json(panel / "panel.json")
     begin, codes = time.time(), []
     for i, member in enumerate(info["members"], 1):
         print(f"\n===== panel member {i} of {len(info['members'])}: {info['agents'][i - 1]} =====")
-        codes.append(wait_for(Path(member), max(timeout - (time.time() - begin), 60)))
+        codes.append(wait_for(Path(member), max(timeout - (time.time() - begin), 60), brief))
     print(f"\n===== panel {panel.name}: {sum(c == 0 for c in codes)} of {len(codes)} ok =====")
     print("crew: compare the answers: where they disagree, check the claim yourself before using it.")
     return 0 if all(c == 0 for c in codes) else (3 if 3 in codes else 2)
 
 
-def print_result(task: Path) -> int:
+def print_result(task: Path, brief: bool = False) -> int:
     time.sleep(0.2)
+    reattribute(task)
     r = read_json(task / "result.json")
     scope = r.get("scope") or {}
     secs = r.get("seconds")
@@ -1048,11 +1157,21 @@ def print_result(task: Path) -> int:
     if scope:
         print(f"crew: scope access={scope.get('access')} web={on_off(scope.get('web'))} network={on_off(scope.get('network'))}")
     print(f"crew: dir={task}")
+    try:
+        choice_note = read_json(task / "cmd.json").get("choice_note")
+    except (OSError, ValueError):
+        choice_note = None
+    if choice_note:
+        print(f"crew: WARNING agent choice: {choice_note}")
     if r.get("note"):
         print(f"crew: note={r['note']}")
     if r.get("violations"):
         print("crew: SCOPE VIOLATION: files changed that this task's access level does not allow:")
         for p in r["violations"]:
+            print(f"  {p}")
+    if r.get("concurrent_changes"):
+        print("crew: changed during this run by other crew write runs (not counted as violations):")
+        for p in r["concurrent_changes"]:
             print(f"  {p}")
     if r.get("touched_files"):
         print("crew: touched files (relative to the repository root):")
@@ -1064,10 +1183,17 @@ def print_result(task: Path) -> int:
             print(f"  {line}")
     print("----- final answer -----")
     final = task / "final.md"
-    if final.exists() and final.read_text(encoding="utf-8", errors="replace").strip():
-        print(final.read_text(encoding="utf-8", errors="replace").rstrip())
-    else:
+    answer = final.read_text(encoding="utf-8", errors="replace").rstrip() if final.exists() else ""
+    if not answer.strip():
         print("(no final answer; read raw.log in the task dir)")
+    elif brief:
+        lines = answer.splitlines()
+        shown = "\n".join(lines[:BRIEF_LINES])[:BRIEF_CHARS]
+        print(shown)
+        if len(shown) < len(answer):
+            print(f"... ({len(lines)} lines, {len(answer)} characters in all; read the rest in {final})")
+    else:
+        print(answer)
     return 0 if r.get("status") == "ok" else 2
 
 
@@ -1161,6 +1287,13 @@ def cmd_run(args) -> int:
                    if o[0]["backend"] not in excluded]
         if not options:
             raise CrewError(f"no eligible agent for role '{args.role}' outside {', '.join(excluded)}")
+        family = CALLER_FAMILY.get(caller)
+        if (role_cfg.get("other_family") and family and not args.panel
+                and all(model_family(o[0]) == family for o in options)):
+            raise CrewError(
+                f"role '{args.role}' is for a second opinion from another model family, but every installed "
+                f"candidate is {family}, the caller's own family. Install another vendor's CLI (see "
+                f"`crew.py doctor`), or name an agent with --agent to accept the same family.")
 
     if args.panel:
         return run_panel(cfg, args, role_cfg, options, cwd, scope, text, caller, request)
@@ -1172,7 +1305,7 @@ def cmd_run(args) -> int:
     task = launch_task(cfg, args, args.role, role_cfg, spec, exe, cwd, scope, text, caller, note,
                        extra={"request": request, "retry_of": str(retry_of) if retry_of else None})
     if args.wait:
-        return wait_for(task, args.timeout)
+        return wait_for(task, args.timeout, args.brief)
     return 0
 
 
@@ -1202,7 +1335,7 @@ def run_resume(cfg, args) -> int:
                        resolve_caller(args.caller), None, session=session,
                        extra={"resumed_from": str(prev), "prior_session_cost_usd": prior_cost})
     if args.wait:
-        return wait_for(task, args.timeout)
+        return wait_for(task, args.timeout, args.brief)
     return 0
 
 
@@ -1231,7 +1364,7 @@ def run_panel(cfg, args, role_cfg, options, cwd, scope, text, caller, request) -
     (panel / "request.md").write_text(text, encoding="utf-8")
     print(f"crew: panel={panel}")
     if args.wait:
-        return wait_for_panel(panel, args.timeout)
+        return wait_for_panel(panel, args.timeout, args.brief)
     return 0
 
 
@@ -1255,7 +1388,9 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
         if not top:
             raise CrewError("A review needs a git repository (--cd inside one)")
         if not builtin_review:
-            text = review_task(text, args.target, top, embed=(backend != "codex"), access=scope["access"])
+            # Agents that can run git read the diff themselves; the rest get it in the prompt.
+            embed = backend == "agy" or (backend == "claude" and scope["access"] == "read")
+            text = review_task(text, args.target, top, embed=embed, access=scope["access"])
     if not text and not builtin_review:
         raise CrewError("Nothing to do: pass --task or --task-file")
 
@@ -1313,7 +1448,7 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
            "allowed_paths": allowed, "max_minutes": max_minutes, "resumed_from": None,
            "prior_session_cost_usd": None, "fact_check": bool(scope["web"] and cfg.get("fact_check", True)),
            "prune_scratch": bool(cfg.get("prune_scratch", True)), "cache": str(cache) if cache else None,
-           "view": view, "hold": hold, "created": now_iso()}
+           "view": view, "hold": hold, "choice_note": choice_note, "created": now_iso()}
     cmd.update(extra or {})
     write_json(task / "cmd.json", cmd)
 
@@ -1344,10 +1479,41 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
 def cmd_collect(args) -> int:
     task = Path(args.dir).expanduser().resolve()
     if (task / "panel.json").exists():
-        return wait_for_panel(task, args.timeout)
+        return wait_for_panel(task, args.timeout, args.brief)
     if not (task / "cmd.json").exists():
         raise CrewError(f"{task} is not a crew task directory")
-    return wait_for(task, args.timeout)
+    return wait_for(task, args.timeout, args.brief)
+
+
+def cmd_stop(args) -> int:
+    """Stop a running task (or every member of a panel) and record it as cancelled."""
+    task = Path(args.dir).expanduser().resolve()
+    if (task / "panel.json").exists():
+        members = [Path(m) for m in read_json(task / "panel.json").get("members") or []]
+    elif (task / "cmd.json").exists():
+        members = [task]
+    else:
+        raise CrewError(f"{task} is not a crew task directory")
+    code = 0
+    for member in members:
+        if (member / "result.json").exists():
+            print(f"crew: {member.name} has already finished")
+            continue
+        (member / STOP_FILE).write_text(now_iso(), encoding="utf-8")
+        if claim_task(member):  # the runner hasn't started; claiming the task keeps it from starting
+            write_cancelled_result(member, "stopped with `crew.py stop` before the agent started")
+        elif runner_state(member) == "dead":
+            write_cancelled_result(member, "stopped with `crew.py stop`; the runner had already exited")
+        end = time.time() + STOP_WAIT_SEC
+        while not (member / "result.json").exists() and time.time() < end:
+            time.sleep(0.5)
+        if not (member / "result.json").exists():
+            print(f"crew: {member.name} did not stop within {STOP_WAIT_SEC}s; its runner may be stuck")
+            code = 2
+            continue
+        print(f"crew: stopped {member.name}")
+        print_result(member, brief=True)
+    return code
 
 
 def cmd_check(args) -> int:
@@ -2404,8 +2570,9 @@ def kill_tree(proc: subprocess.Popen) -> None:
     import signal
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-        time.sleep(5)
-        if proc.poll() is None:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
@@ -2451,6 +2618,9 @@ def cmd_runner(args) -> int:
         print(f"crew: {task.name} is already being run by another runner; nothing to do here.")
         return 0
     started = time.time()
+    if (task / STOP_FILE).exists():
+        write_cancelled_result(task, "stopped with `crew.py stop` before the agent started")
+        return 0
     stop = threading.Event()
     threading.Thread(target=heartbeat, args=(task, stop), daemon=True).start()
     cmd = None
@@ -2567,11 +2737,21 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
     timer = threading.Timer(float(cmd.get("max_minutes") or 60) * 60, on_timeout)
     timer.daemon = True
     timer.start()
+    cancelled, done = threading.Event(), threading.Event()
+
+    def watch_stop():
+        while not done.wait(0.5):
+            if (task / STOP_FILE).exists():
+                cancelled.set()
+                kill_tree(proc)
+                return
+    threading.Thread(target=watch_stop, daemon=True).start()
     try:
         for raw in proc.stdout:
             view.feed(raw.decode("utf-8", "replace"))
         rc = proc.wait()
     finally:
+        done.set()
         timer.cancel()
         view.close()
 
@@ -2583,13 +2763,22 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
     has_final = final.exists() and final.read_text(encoding="utf-8", errors="replace").strip() != ""
 
     touched = changed_paths(before, git_state(top)) if top else []
-    violations = []
+    violations, concurrent, running = [], [], []
+    if top and touched:
+        # Another crew write run in the same repository changes files too, and the git check
+        # can't tell whose change is whose. Files a finished one reported are its own.
+        start = _parse_time(cmd.get("created")) or started
+        theirs, running = concurrent_writes(task, top, start, time.time())
+        if cmd["scope"]["access"] != "write":
+            concurrent = [p for p in touched if p in theirs]
     if cmd["scope"]["access"] != "write":
         allowed = cmd.get("allowed_paths") or []
-        violations = [p for p in touched if not any(p.startswith(a) for a in allowed)]
+        violations = [p for p in touched if p not in concurrent and not any(p.startswith(a) for a in allowed)]
 
     note = None
-    if timed_out.is_set():
+    if cancelled.is_set():
+        status, note = "cancelled", "stopped with `crew.py stop`"
+    elif timed_out.is_set():
         status, note = "timeout", f"killed after max_minutes={cmd.get('max_minutes')}"
     elif rc != 0 or view.error:
         status = "agent-error"
@@ -2608,10 +2797,18 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         if status in ("empty", "agent-error"):
             status = "permission-denied"
         note = f"{note}; {denied}" if note else denied
+    base_status, base_note = status, note
     if violations:
         status = "scope-violation"
         note = (f"{len(violations)} file(s) changed outside what access={cmd['scope']['access']} allows. "
                 "If you edited the repo yourself during the run, those edits are included.")
+        extra = concurrent_note(concurrent, running)
+        if extra:
+            note += f" {extra}."
+    elif cmd["scope"]["access"] == "write" and running:
+        overlap = (f"other crew write run(s) in this repository were running at the same time "
+                   f"({', '.join(running)}); touched_files may include their changes")
+        note = f"{note}; {overlap}" if note else overlap
 
     status, note, quota, retried_as, checks = after_run(task, cmd, view, status, note)
     seconds = round(time.time() - started, 1)
@@ -2625,6 +2822,8 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
               "scope": cmd["scope"], "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
               "session_cost_usd": session_cost, "cost_note": view.cost_note, "model_usage": view.model_usage,
               "session_id": view.session, "touched_files": touched, "violations": violations,
+              "concurrent_changes": concurrent, "concurrent_running": running if violations else [],
+              "base_status": base_status if violations else None, "base_note": base_note if violations else None,
               "denied_tools": view.denied, "quota": quota, "checks": checks, "retried_as": retried_as,
               "final": str(final), "finished": now_iso()}
     write_json(task / "result.json", result)
@@ -2679,6 +2878,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="keep the terminal tab open after the task ends")
     r.add_argument("--max-minutes", type=float, help="kill the agent after this long")
     r.add_argument("--wait", action="store_true", help="block until done, then print the final answer")
+    r.add_argument("--brief", action="store_true",
+                   help=f"with --wait, print only the first {BRIEF_LINES} lines of the answer and its path")
     r.add_argument("--timeout", type=float, default=3600, help="seconds --wait waits (default 3600)")
     r.add_argument("--panel", type=int, nargs="?", const=2, default=None, metavar="N",
                    help="send the task to N agents (default 2) from different model families at once")
@@ -2698,7 +2899,12 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("collect", help="wait for / reprint a task")
     c.add_argument("dir")
     c.add_argument("--timeout", type=float, default=3600)
+    c.add_argument("--brief", action="store_true", help=f"print only the first {BRIEF_LINES} lines of the answer")
     c.set_defaults(func=cmd_collect)
+
+    st = sub.add_parser("stop", help="stop a running task or panel; it is recorded as cancelled")
+    st.add_argument("dir")
+    st.set_defaults(func=cmd_stop)
 
     s = sub.add_parser("status", help="recent tasks and their state")
     s.add_argument("--last", type=int, default=10)

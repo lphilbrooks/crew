@@ -210,6 +210,7 @@ crew.py run --resume <run folder> --task "Use the helper in util.py instead" --w
 crew.py run --role research --task "Latest stable <library> version, with sources" --wait
 crew.py run --role research --panel --task "..." --wait     # same question to two model families
 crew.py check <run folder>                                  # re-run the fact check
+crew.py stop <run folder>                                   # stop a running task or panel
 crew.py prune --dry-run                                     # build output older runs still hold
 crew.py status | stats | quota | collect <run folder> | roles | models | doctor
 ```
@@ -224,6 +225,7 @@ Useful flags:
 | `--agent <spec>` | use a specific agent, e.g. `codex:gpt-6.1-sol@high` |
 | `--caller codex\|claude\|agy` | say who's calling, so crew skips that model family |
 | `--panel [N]` | send the task to N agents (default 2) from different model families, to compare |
+| `--brief` | with `--wait` or `collect`, print only the first 40 lines of the answer and its path |
 
 ## How strictly scopes are enforced
 
@@ -256,7 +258,10 @@ Models live in config, not code.
 | light | Claude Haiku 5.5, then Gemini Flash, then Codex gpt-6-luna | read |
 
 crew skips the caller's own model family, so from Claude Code the last three roles go to Codex or
-Gemini, and Haiku 5.5 runs them when Codex or agy is in charge. Claude agents use full model ids
+Gemini, and Haiku 5.5 runs them when Codex or agy is in charge. `review` and `check` are marked
+`"other_family": true`: if the only installed candidates are from the caller's own family, they
+refuse to run rather than give a second opinion from the same family. Name an agent with `--agent`
+to run one anyway. Other roles fall back to the caller's family and say so in the result. Claude agents use full model ids
 (`claude:claude-haiku-5-5`) because Claude Code's aliases can lag a release.
 
 Change them from the command line:
@@ -306,7 +311,8 @@ or when you want a per-task permission scope and a readable record of every prom
 | a role says `NOT INSTALLED` | install that CLI, or set `backends.<name>.exe` |
 | agy research returns `permission-denied` | run `crew.py setup-agy-web` |
 | an agy tab stays blank for minutes | normal: agy prints only when it's done |
-| unexpected `scope-violation` | your own edits during the run count too |
+| unexpected `scope-violation` | your own edits during the run count too. If a crew `write` task in the same repository was still running, collect the run again after it finishes |
+| `review` or `check` refuses to run | only the caller's own model family is installed; install another CLI, or pass `--agent` to accept it |
 | Codex on Windows can't run any command | set up its sandbox. From a remote or service session (Windows session 0) it can't work at all; `doctor` warns about this |
 | no tab opens | run `crew.py doctor`, or use `--view hidden` |
 | status `limited` | the vendor's usage limit was hit; `note` says whether the task moved to another agent. `crew.py quota` shows when limits reset |
@@ -326,6 +332,19 @@ macOS, and checks the skill against the
 [Agent Skills specification](https://agentskills.io/specification).
 
 ## Changes
+
+**1.4.0**
+- `review` and `check` refuse to run on the caller's own model family unless `--agent` names the
+  agent, and `--wait` prints a warning when any other role falls back to it.
+- Reviews whose diff is pasted into the prompt leave out untracked files whose names suggest
+  secrets (`.env`, keys, credentials) and untracked files over 100 KB.
+- Claude reviews with `verify` access read the diff with git instead of having it pasted in, so
+  large diffs no longer fail.
+- A `read` or `verify` run no longer reports a concurrent crew `write` run's changes in the same
+  repository as violations; they are listed under `concurrent_changes`.
+- `crew.py stop` stops a running task or panel and records it as `cancelled`.
+- `--brief` prints only the start of each answer and the path to the rest.
+- Timeouts stop the agent as soon as it exits instead of always waiting 5 seconds.
 
 **1.3.0**
 - Build output is removed from a run's scratch folder when it finishes. Before this, every Rust

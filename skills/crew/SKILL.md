@@ -15,7 +15,7 @@ compatibility: >-
   signed in, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
 ---
 
 # crew
@@ -33,9 +33,11 @@ The script is `scripts/crew.py` in this skill's folder (Python 3.9+). Run it wit
 
 1. Always pass `--caller` with your own name (`codex`, `claude` or `agy`). crew then skips your
    vendor, so the user gets a second opinion from a different model family.
-2. Run `crew.py roles --caller <you>` to see which agent each role will use. If one says
-   `NOT INSTALLED` or `INVALID`, run `crew.py doctor` and show the user the output. Don't change
-   the user's config unless they ask.
+2. Each `run` prints the agent it chose, and `--wait` prints a `WARNING agent choice` line when
+   that agent is from your own model family. `review` and `check` refuse to run on your own family
+   unless you name the agent with `--agent`. If a run fails because nothing suitable is installed,
+   run `crew.py doctor` and show the user the output. `crew.py roles --caller <you>` shows every
+   role at once. Don't change the user's config unless they ask.
 3. If your own shell runs in a sandbox (Codex does), ask the user to approve running crew outside
    it. crew writes to `~/.crew` and starts agents that need the network and the user's logins.
 
@@ -88,6 +90,7 @@ Other options:
 | `--slug` | name the run folder |
 | `--max-minutes` | kill the agent after this long |
 | `--panel [N]` | send the task to N agents (default 2) from different model families at once |
+| `--brief` | with `--wait` or `collect`, print only the first 40 lines of the answer and its path |
 
 **Panels.** For research where being wrong is costly, `--panel` asks agents from two model
 families the same question. Their mistakes rarely overlap, so read where they disagree and check
@@ -102,10 +105,20 @@ last known usage.
 
 Quick lookups can run in the foreground with `--wait`. Reviews and implementation usually take
 2 to 15 minutes, and so does bigger research. Run those in a background shell if you have one and
-keep working. If a wait times out, `crew.py collect <run folder>` picks the task up again.
+keep working. If your shell limits how long a command may run, start the task without `--wait`
+and call `crew.py collect <run folder> --timeout <seconds>` with a timeout below that limit,
+repeating until it finishes. The task keeps running between calls.
+
+`crew.py stop <run folder or panel folder>` stops a task that has gone wrong. It is recorded as
+`cancelled`, and any files it changed are left for you to inspect.
+
+Use `--brief` when several answers will come back, or an answer may be long: it prints the first
+40 lines and the path to `final.md`, so you can read the rest only where you need it.
 
 Independent tasks can run in parallel. Parallel `write` tasks in one repository must touch
-different files, and each task must say which.
+different files, and each task must say which. A `read` or `verify` task that runs alongside a
+`write` task in the same repository doesn't count that task's changes as violations once it has
+finished; if it is still running, collect the read task again after it finishes.
 
 `--wait` prints the status, the scope, any violations or changed files, and the agent's answer.
 After a task with web access, it also lists any cited URL that failed and any package version
@@ -127,6 +140,7 @@ It exits 0 for ok, 2 for any other status, 3 if the wait timed out and 1 for usa
 | `timeout` | killed at `--max-minutes` |
 | `harness-error` | crew's runner failed or was closed |
 | `limited` | the vendor's usage limit was hit; `note` says whether it was sent on to another agent |
+| `cancelled` | stopped with `crew.py stop` |
 
 ## Follow-ups
 
@@ -148,4 +162,6 @@ continues the same session with the same scope.
 
 The task, and any files the agent reads, go to that vendor under the user's plan and its data
 terms. Check the user is happy with that before sending private material. Never put secrets in a
-task, because run folders under `~/.crew/runs/` keep a copy.
+task, because run folders under `~/.crew/runs/` keep a copy. When a review pastes the diff into
+the prompt, untracked files whose names suggest secrets (`.env`, keys, credentials) and files over
+100 KB are left out by name only.

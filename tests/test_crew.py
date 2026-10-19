@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -57,9 +58,10 @@ class Sandbox(unittest.TestCase):
         # Tasks started without --wait may still be running in the repo. Let them finish, or
         # Windows refuses to delete folders they're using.
         import shutil
-        import time
         deadline = time.time() + 60
-        for task in (self.home / "runs").glob("*") if (self.home / "runs").exists() else []:
+        # Panel folders and hand-made run folders never get a result.json; only real tasks have task.md.
+        for task in (self.home / "runs").glob("*/task.md") if (self.home / "runs").exists() else []:
+            task = task.parent
             while not (task / "result.json").exists() and time.time() < deadline:
                 time.sleep(0.5)
         time.sleep(1)
@@ -230,6 +232,22 @@ class TestEndToEnd(Sandbox):
         text = (self.task_dir(out) / "task.md").read_text(encoding="utf-8")
         self.assertIn("<diff>", text)
         self.assertIn("+changed", text)
+
+    def test_embedded_review_leaves_out_secret_and_large_files(self):
+        (self.repo / ".env").write_text("API_KEY=hunter2\n")
+        (self.repo / "deploy.pem").write_text("-----BEGIN KEY-----\n")
+        (self.repo / "big.log").write_text("z" * (crew.UNTRACKED_EMBED_LIMIT + 1))
+        (self.repo / "notes.txt").write_text("plain notes\n")
+        rc, out = self.crew("run", "--role", "review", "--agent", "agy:m", "--access", "read", "--cd", str(self.repo),
+                            "--task", "x", "--wait")
+        self.assertEqual(rc, 0, out)
+        text = (self.task_dir(out) / "task.md").read_text(encoding="utf-8")
+        self.assertNotIn("hunter2", text)
+        self.assertNotIn("BEGIN KEY", text)
+        self.assertNotIn("zzzz", text)
+        self.assertIn("plain notes", text)
+        self.assertEqual(text.count("may hold secrets"), 2)
+        self.assertIn("larger than 100 KB", text)
 
     def test_agy_research_ok_and_fetch_warning(self):
         rc, out = self.crew("run", "--role", "research", "--agent", "google-fast", "--cd", str(self.repo),
@@ -438,9 +456,18 @@ class TestClaude(Sandbox):
                             "--task", "x", "--wait", mode="fail")
         self.assertEqual(self.result(out)["status"], "agent-error")
 
-    def test_review_embeds_diff_and_resume(self):
+    def test_review_verify_reads_diff_with_git(self):
         (self.repo / "a.txt").write_text("changed\n")
         rc, out = self.crew("run", "--role", "review", "--agent", "claude:opus", "--cd", str(self.repo), "--wait")
+        self.assertEqual(rc, 0, out)
+        text = (self.task_dir(out) / "task.md").read_text(encoding="utf-8")
+        self.assertNotIn("<diff>", text)
+        self.assertIn("git diff HEAD", text)
+
+    def test_review_embeds_diff_and_resume(self):
+        (self.repo / "a.txt").write_text("changed\n")
+        rc, out = self.crew("run", "--role", "review", "--agent", "claude:opus", "--access", "read",
+                            "--cd", str(self.repo), "--wait")
         self.assertEqual(rc, 0, out)
         self.assertIn("+changed", (self.task_dir(out) / "task.md").read_text(encoding="utf-8"))
         first = self.task_dir(out)
@@ -505,6 +532,26 @@ class TestCaller(Sandbox):
         (self.home / "config.json").write_text(json.dumps(cfg))
         rc, out = self.crew("run", "--role", "solo", "--caller", "codex", "--cd", str(self.repo), "--task", "x")
         self.assertIn("also the caller", out)
+
+    def only_claude(self, role):
+        rc, out = self.crew("set-role", role, "--agent", "claude-strong")
+        self.assertEqual(rc, 0, out)
+
+    def test_second_opinion_refuses_own_family(self):
+        self.only_claude("check")
+        rc, out = self.crew("run", "--role", "check", "--cd", str(self.repo), "--task", "x", CREW_CALLER="claude")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the caller's own family", out)
+        rc, out = self.crew("run", "--role", "check", "--agent", "claude-strong", "--cd", str(self.repo),
+                            "--task", "x", "--wait", CREW_CALLER="claude")
+        self.assertEqual(rc, 0, out)
+
+    def test_other_roles_warn_on_own_family(self):
+        self.only_claude("light")
+        rc, out = self.crew("run", "--role", "light", "--cd", str(self.repo), "--task", "x", "--wait",
+                            CREW_CALLER="claude")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("WARNING agent choice: anthropic is also the caller's model family", out)
 
     def test_nested_dispatch_refused(self):
         rc, out = self.crew("run", "--role", "light", "--cd", str(self.repo), "--task", "x",
@@ -713,3 +760,88 @@ class TestScratch(Sandbox):
         self.assertEqual(Path(cmd["env"]["CARGO_TARGET_DIR"]), cache / "target")
         roots = [a for a in cmd["argv"] if a.startswith("sandbox_workspace_write.writable_roots=")][0]
         self.assertIn(json.dumps(str(cache))[1:-1], roots)
+
+
+class TestRunControl(Sandbox):
+    """crew.py stop, --brief, and violations explained by concurrent write runs."""
+
+    def fake_write_run(self, name, touched=None, running=False):
+        top = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        run = self.home / "runs" / f"{crew.dt.datetime.now():%Y%m%d-%H%M%S}-implement-{name}"
+        run.mkdir(parents=True)
+        (run / "cmd.json").write_text(json.dumps({"git_top": str(Path(top)), "scope": {"access": "write"},
+                                                  "created": crew.now_iso()}))
+        if running:
+            (run / "run.json").write_text(json.dumps({"pid": os.getpid(), "beat": time.time() + 3600}))
+        else:
+            self.finish_fake_run(run, touched)
+        return run
+
+    def finish_fake_run(self, run, touched):
+        (run / "result.json").write_text(json.dumps({"status": "ok", "touched_files": touched,
+                                                     "finished": crew.now_iso()}))
+
+    def test_concurrent_write_run_is_not_a_violation(self):
+        self.fake_write_run("other", ["touched-by-agent.txt"])
+        rc, out = self.crew("run", "--role", "check", "--cd", str(self.repo), "--task", "x", "--wait", mode="touch")
+        self.assertEqual(rc, 0, out)
+        r = self.result(out)
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["violations"], [])
+        self.assertEqual(r["concurrent_changes"], ["touched-by-agent.txt"])
+        self.assertIn("other crew write runs", out)
+
+    def test_violation_rechecked_after_running_write_run_finishes(self):
+        other = self.fake_write_run("other", running=True)
+        rc, out = self.crew("run", "--role", "check", "--cd", str(self.repo), "--task", "x", "--wait", mode="touch")
+        self.assertEqual(rc, 2, out)
+        r = self.result(out)
+        self.assertEqual(r["status"], "scope-violation")
+        self.assertIn(other.name, r["note"])
+        task = self.task_dir(out)
+        self.finish_fake_run(other, ["touched-by-agent.txt"])
+        rc, out = self.crew("collect", str(task))
+        self.assertEqual(rc, 0, out)
+        r = json.loads((task / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["concurrent_changes"], ["touched-by-agent.txt"])
+
+    def test_unrelated_change_is_still_a_violation(self):
+        self.fake_write_run("other", ["something-else.txt"])
+        rc, out = self.crew("run", "--role", "check", "--cd", str(self.repo), "--task", "x", "--wait", mode="touch")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(self.result(out)["violations"], ["touched-by-agent.txt"])
+
+    def test_stop_cancels_running_task(self):
+        rc, out = self.crew("run", "--role", "light", "--cd", str(self.repo), "--task", "x", mode="sleep")
+        self.assertEqual(rc, 0, out)
+        task = self.task_dir(out)
+        started = time.time()
+        rc, out = self.crew("stop", str(task))
+        self.assertEqual(rc, 0, out)
+        self.assertLess(time.time() - started, 25)
+        r = json.loads((task / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(r["status"], "cancelled")
+        rc, out = self.crew("stop", str(task))
+        self.assertIn("already finished", out)
+
+    def test_brief_shortens_long_answers(self):
+        answer = "\n".join(f"line {i}" for i in range(100))
+        rc, out = self.crew("run", "--role", "light", "--agent", "claude:opus", "--cd", str(self.repo),
+                            "--task", "x", "--wait", "--brief", FAKE_ANSWER=answer)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("line 39", out)
+        self.assertNotIn("line 40", out)
+        self.assertIn("100 lines", out)
+        rc, out = self.crew("collect", str(self.task_dir(out)))
+        self.assertIn("line 99", out)
+
+
+class TestLooksSecret(unittest.TestCase):
+    def test_names(self):
+        for name in (".env", ".env.local", "config/prod.env", "server.PEM", "id_ed25519", "gcp-credentials.json",
+                     "secrets.yaml", "prod.tfvars"):
+            self.assertTrue(crew.looks_secret(name), name)
+        for name in ("tokenizer.py", "secret_sharing.py", "env.py", "README.md", "credentials.py"):
+            self.assertFalse(crew.looks_secret(name), name)
