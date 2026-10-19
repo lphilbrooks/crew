@@ -256,8 +256,7 @@ you (or your agent) can name one without knowing each CLI's model ids:
 | Name | CLI | Efforts (default first) | Good for |
 |---|---|---|---|
 | `gemini-flash` | agy | medium, low, high | cheap research with Google Search |
-| `gemini-3.7-flash`, `gemini-3.6-flash` | agy | medium, low, high | older Flash versions |
-| `gemini-pro` | agy | high, low | Gemini 3.1 Pro; newer agy versions may not offer it |
+| `argon` | agy | medium, low, high | Gemini 4 Argon (replaced Gemini Pro): hard reasoning and builds; its own weekly quota |
 | `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
 | `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
 | `sol` | codex | high, low, medium, xhigh, max | reviews and harder builds |
@@ -363,8 +362,8 @@ macOS, and checks the skill against the
 **1.5.0**
 - Models by name: `--agent gemini-flash@medium`, `--agent "gemini flash" --effort medium`, `sol`,
   `luna`, `opus via agy` and so on. Each model lists the efforts it takes, and others are refused.
-  The list covers every model the three CLIs are known to offer, including older Gemini Flash
-  versions, Gemini 3.1 Pro, Claude through agy and gpt-oss.
+  The list covers the models the three CLIs offer: Codex Sol, Astra and Luna; Claude Opus,
+  Sonnet, Haiku and Fable; and through agy, Gemini 3.8 Flash, Gemini 4 Argon, Claude and gpt-oss.
 - `crew.py models` prints the list and checks it against the installed CLIs.
 - `build` and `build-light` name the `implement` roles.
 - Research goes to Gemini 3.8 Flash first.

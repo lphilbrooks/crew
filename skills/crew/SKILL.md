@@ -68,13 +68,12 @@ the real setup.
 
 When the user names a model ("use gemini flash, medium effort"), pass it with `--agent`:
 `--agent gemini-flash@medium`, or `--agent "gemini flash" --effort medium`. Plain names work too
-(`flash`, `codex`, `opus via agy`). A named model is always used, even from your own vendor.
+(`flash`, `codex`, `gemini pro` for Argon, `opus via agy`). A named model is always used, even from your own vendor.
 
 | Name | CLI | Efforts (default first) | Good for |
 |---|---|---|---|
 | `gemini-flash` | agy | medium, low, high | cheap research with Google Search |
-| `gemini-3.7-flash`, `gemini-3.6-flash` | agy | medium, low, high | older Flash versions |
-| `gemini-pro` | agy | high, low | Gemini 3.1 Pro; newer agy versions may not offer it |
+| `argon` | agy | medium, low, high | Gemini 4 Argon (replaced Gemini Pro): hard reasoning and builds; its own weekly quota |
 | `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
 | `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
 | `sol` | codex | high, low, medium, xhigh, max | reviews and harder builds |

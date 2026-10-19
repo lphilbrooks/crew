@@ -28,7 +28,9 @@ class Naming(unittest.TestCase):
             "gemini flash medium": "agy:gemini-3.8-flash-medium",
             "Gemini Flash low effort": "agy:gemini-3.8-flash-low",
             "flash": "agy:gemini-3.8-flash-medium",
-            "gemini 3.7 flash high": "agy:gemini-3.7-flash-high",
+            "argon": "agy:gemini-4-argon-medium",
+            "gemini pro high": "agy:gemini-4-argon-high",
+            "argon 4 low": "agy:gemini-4-argon-low",
             "opus via agy": "agy:claude-opus-5-5-high",
             "gpt-oss": "agy:gpt-oss-120b-medium",
             "codex": "codex:gpt-6.1-sol@high",
@@ -123,6 +125,28 @@ class ModelsCommand(unittest.TestCase):
         self.assertIn("gemini-flash", r.stdout)
         self.assertIn("gemini-3.8-flash-<effort>", r.stdout)
         self.assertIn("*medium", r.stdout)
+
+    def test_missing_model_points_to_lookalike(self):
+        import contextlib
+        import io
+        import types
+        offered = [{"slug": s, "description": ""} for s in
+                   ("gemini-3.8-flash-medium", "gemini-4-argon", "gpt-oss-120b-medium")]
+        saved = crew.backend_cmd, crew.agy_models, crew.codex_models, crew.load_config
+        crew.backend_cmd = lambda cfg, b: [b] if b == "agy" else None
+        crew.agy_models = lambda cfg: offered
+        crew.codex_models = lambda: None
+        crew.load_config = lambda: CFG
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                crew.cmd_models(types.SimpleNamespace(offline=False))
+        finally:
+            crew.backend_cmd, crew.agy_models, crew.codex_models, crew.load_config = saved
+        text = out.getvalue()
+        self.assertIn("argon (gemini-4-argon-{effort}) is not offered by your agy; it offers gemini-4-argon", text)
+        self.assertIn("agy-opus (claude-opus-5-5-{effort}) is not offered", text)
+        self.assertNotIn("gemini-flash (", text)
 
 
 if __name__ == "__main__":

@@ -1820,7 +1820,11 @@ def cmd_models(args) -> int:
                    if "{effort}" in entry["model"] else [entry["model"]])
             known.update(ids)
             if not any(i in have for i in ids):
-                print(f"  {backend}: {key} ({entry['model']}) is not offered by your {backend}")
+                word = key.split("-")[-1]
+                alike = sorted(m for m in have if m and word in m)
+                print(f"  {backend}: {key} ({entry['model']}) is not offered by your {backend}"
+                      + (f"; it offers {', '.join(alike)}: if that is the same model, set its id under"
+                         f" models.{key}.model in ~/.crew/config.json" if alike else ""))
         extra = sorted(m for m in have if m and m not in known)
         print(f"  {backend}: installed; offers {len(have)} model id(s)"
               + (f"; not in the list above (use {backend}:<id>): {', '.join(extra)}" if extra else ""))
