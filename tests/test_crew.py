@@ -371,18 +371,22 @@ class TestPreambleAndDefaults(unittest.TestCase):
         text = crew.scope_preamble("codex", {"access": "write", "web": False, "network": False}, Path("s"), None, False)
         self.assertIn("run the checks the task names", text)
 
-    def test_haiku_5_5_leads_the_fast_roles(self):
+    def test_fast_role_defaults(self):
         cfg = crew.read_json(crew.DEFAULT_CONFIG)
         self.assertEqual(cfg["agents"]["claude-fast"], "claude:claude-haiku-5-5@medium")
-        for role in ("implement-light", "research", "light"):
+        for role in ("implement-light", "light"):
             self.assertEqual(cfg["roles"][role]["agent"][0], "claude-fast", role)
-        # Called from Claude, crew still hands these roles to another vendor.
+        # Research goes to Gemini Flash first, for its built-in Google Search.
+        self.assertEqual(cfg["roles"]["research"]["agent"][:2], ["google-fast", "claude-fast"])
         installed = lambda c, b: [b]  # noqa: E731
         saved, crew.backend_cmd = crew.backend_cmd, installed
         try:
-            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="claude", quota={})
-            self.assertEqual(spec["backend"], "codex")
-            spec, _, _ = crew.choose_agent(cfg, cfg["roles"]["research"]["agent"], caller="codex", quota={})
+            research = cfg["roles"]["research"]["agent"]
+            for caller in ("claude", "codex"):
+                spec, _, _ = crew.choose_agent(cfg, research, caller=caller, quota={})
+                self.assertEqual(crew.spec_str(spec), "agy:gemini-3.8-flash-medium", caller)
+            # Called from agy, research still goes to another vendor.
+            spec, _, _ = crew.choose_agent(cfg, research, caller="agy", quota={})
             self.assertEqual(crew.spec_str(spec), "claude:claude-haiku-5-5@medium")
         finally:
             crew.backend_cmd = saved
@@ -779,8 +783,9 @@ class TestRunControl(Sandbox):
         return run
 
     def finish_fake_run(self, run, touched):
-        (run / "result.json").write_text(json.dumps({"status": "ok", "touched_files": touched,
-                                                     "finished": crew.now_iso()}))
+        # Finishes after the run under test has started, as a run working alongside it would.
+        later = (crew.dt.datetime.now().astimezone() + crew.dt.timedelta(minutes=2)).isoformat(timespec="seconds")
+        (run / "result.json").write_text(json.dumps({"status": "ok", "touched_files": touched, "finished": later}))
 
     def test_concurrent_write_run_is_not_a_violation(self):
         self.fake_write_run("other", ["touched-by-agent.txt"])

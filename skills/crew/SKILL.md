@@ -15,7 +15,7 @@ compatibility: >-
   signed in, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
 ---
 
 # crew
@@ -43,21 +43,49 @@ The script is `scripts/crew.py` in this skill's folder (Python 3.9+). Run it wit
 
 ## Running a task
 
+Every task is one command: a role says what kind of job it is, and `--agent` says which model
+does it. Leave `--agent` out to use the role's default.
+
 ```sh
-crew.py run --caller <you> --role <role> --cd <repo> --task "<what to do>" --wait
+crew.py run --caller <you> --role <role> [--agent <model>[@effort]] --cd <repo> --task "<what to do>" --wait
 crew.py run --caller <you> --role <role> --cd <repo> --task-file <file> --wait   # longer tasks
 ```
 
-| Role | Default scope | Use for |
-|---|---|---|
-| `review` | verify | reviewing a diff: `--target uncommitted` (default), `commit:<sha>` or `base:<branch>` |
-| `check` | verify | a second opinion on a plan, claim or finding, backed by commands and tests |
-| `implement` | write | a bounded implementation; never commits |
-| `implement-light` | write | boilerplate, fixtures, scaffolding |
-| `research` | read + web | web and documentation lookups, with sources |
-| `light` | read | summarising files or logs, drafting text |
+### Research, review, build
 
-The user may have changed these. `crew.py roles` shows the real setup.
+| Job | Command | Default model | Notes |
+|---|---|---|---|
+| Research | `--role research` | `gemini-flash@medium` (Google Search built in) | read + web. Run `crew.py setup-agy-web` once so agy can open pages, not only search |
+| Review | `--role review` | `sol@high` (Codex) | verify: can run tests. `--target uncommitted` (default), `commit:<sha>` or `base:<branch>` |
+| Build | `--role build` | `sol@medium` (Codex) | write; never commits. agy can edit files but not run commands, so give it work you will test yourself |
+
+Other roles: `check` (second opinion on a plan or claim, can run tests), `build-light` (boilerplate,
+fixtures), `light` (summaries, drafts, read-only). `build` is the same role as `implement`, and
+`build-light` as `implement-light`. The user may have changed the defaults: `crew.py roles` shows
+the real setup.
+
+### Naming a model
+
+When the user names a model ("use gemini flash, medium effort"), pass it with `--agent`:
+`--agent gemini-flash@medium`, or `--agent "gemini flash" --effort medium`. Plain names work too
+(`flash`, `codex`, `opus via agy`). A named model is always used, even from your own vendor.
+
+| Name | CLI | Efforts (default first) | Good for |
+|---|---|---|---|
+| `gemini-flash` | agy | medium, low, high | cheap research with Google Search |
+| `gemini-3.7-flash`, `gemini-3.6-flash` | agy | medium, low, high | older Flash versions |
+| `gemini-pro` | agy | high, low | Gemini 3.1 Pro; newer agy versions may not offer it |
+| `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
+| `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
+| `sol` | codex | high, low, medium, xhigh, max | reviews and harder builds |
+| `astra` | codex | high, low, medium, xhigh, max | frontier reasoning, slower and dearer |
+| `luna` | codex | medium, none, low, high, xhigh, max | fast, cheap builds and lookups |
+| `opus`, `sonnet`, `fable` | claude | high, low, medium, xhigh, max | Claude models |
+| `haiku` | claude | medium, low, high, xhigh, max | cheap Claude research and summaries |
+
+An effort the model doesn't take is refused with the list it does take. Any other model id works
+as `backend:model[@effort]`, e.g. `agy:gemini-3.8-flash-high`. `crew.py models` prints this
+list, other names it understands, and which models the installed CLIs offer or lack.
 
 ### Choose the scope every time
 
@@ -83,8 +111,9 @@ Other options:
 
 | Option | Does |
 |---|---|
-| `--agent <alias or spec>` | use a specific agent, e.g. `codex:gpt-6.1-sol@high` (always honoured) |
-| `--model`, `--effort` | override the model or reasoning effort |
+| `--agent <model>` | a model name from the table above, an alias, or `backend:model[@effort]` (always honoured) |
+| `--effort` | override the reasoning effort |
+| `--model` | override only the model id, keeping the role's CLI |
 | `--view hidden\|tab` | hidden, or in a terminal tab |
 | `--no-hold` | close the tab when the task finishes |
 | `--slug` | name the run folder |
@@ -124,8 +153,8 @@ finished; if it is still running, collect the read task again after it finishes.
 After a task with web access, it also lists any cited URL that failed and any package version
 the registries don't confirm: check those before relying on the answer.
 If the model that ran differs from the one asked for, it says so (`ran <model>`): Claude Code
-resolves short names itself and can lag a release. The fast roles use Claude Haiku 5.5 at
-`medium` effort; pass `--effort high` for knowledge-heavy research.
+resolves short names itself and can lag a release. Research defaults to `medium` effort; pass
+`--effort high` for knowledge-heavy research.
 It exits 0 for ok, 2 for any other status, 3 if the wait timed out and 1 for usage errors.
 
 ## Statuses

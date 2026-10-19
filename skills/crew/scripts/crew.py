@@ -191,9 +191,90 @@ def expand_agent(cfg: dict, ref, _seen=()) -> list:
     agents = cfg.get("agents") or {}
     if ref in agents and ref not in _seen:
         return expand_agent(cfg, agents[ref], _seen + (ref,))
+    spec = catalogue_spec(cfg, ref)
+    if spec:
+        return [spec]
     raise CrewError(
-        f"Unknown agent '{ref}'. Use backend:model[@effort] (backend: {', '.join(BACKENDS)}) "
-        f"or an alias: {', '.join(agents) or '(none defined)'}")
+        f"Unknown agent '{ref}'. Use a model name from `crew.py models` (e.g. gemini-flash@medium), "
+        f"backend:model[@effort] (backend: {', '.join(BACKENDS)}), or an alias: {', '.join(agents) or '(none defined)'}")
+
+
+# ------------------------------------------------------------------- catalogue
+# cfg["models"] names each model once, with the efforts it takes, so a caller can write
+# "gemini-flash@medium" or "gemini flash medium" instead of a backend's own model id.
+
+def norm_name(text) -> str:
+    return re.sub(r"[\s_]+", "-", str(text).strip().lower())
+
+
+def catalogue(cfg: dict) -> dict:
+    return {k: v for k, v in (cfg.get("models") or {}).items() if isinstance(v, dict) and v.get("backend")}
+
+
+def find_model(cfg: dict, name: str):
+    """Catalogue key for a name or one of its spoken names, or None."""
+    name = norm_name(name)
+    for key, entry in catalogue(cfg).items():
+        if name == norm_name(key) or name in (norm_name(n) for n in entry.get("names") or []):
+            return key
+    return None
+
+
+def render_model(entry: dict, effort):
+    """(model id, effort to pass to the CLI). agy puts the effort in the model id."""
+    model = entry["model"]
+    if "{effort}" in model:
+        return model.replace("{effort}", effort), None
+    return model, effort
+
+
+def catalogue_spec(cfg: dict, ref, effort=None):
+    """'gemini-flash@medium', 'gemini flash medium' or 'gemini flash' (+ effort) -> spec, or None."""
+    text = norm_name(ref)
+    text = re.sub(r"-effort$", "", text)
+    if "@" in text:
+        text, _, effort = text.partition("@")
+    key = find_model(cfg, text)
+    if not key and "-" in text and not effort:
+        head, _, tail = text.rpartition("-")
+        key = find_model(cfg, head)
+        known = {e for entry in catalogue(cfg).values() for e in entry.get("efforts") or []}
+        if key and tail in known:
+            effort = tail  # checked against this model's efforts below
+        else:
+            key = None
+    if not key:
+        return None
+    entry = catalogue(cfg)[key]
+    efforts = entry.get("efforts") or []
+    effort = effort or entry.get("default_effort")
+    if effort and efforts and effort not in efforts:
+        raise CrewError(f"{key} takes effort {' | '.join(efforts)}, not '{effort}'")
+    if not efforts:
+        effort = None
+    model, cli_effort = render_model(entry, effort)
+    return {"backend": entry["backend"], "model": model, "effort": cli_effort}
+
+
+def settle_effort(cfg: dict, spec: dict, effort):
+    """Apply an effort to a spec. For a catalogue model, check the effort is one it takes and, for agy,
+    put it in the model id. Other specs pass the effort through unchanged."""
+    for key, entry in catalogue(cfg).items():
+        if entry["backend"] != spec["backend"]:
+            continue
+        efforts = entry.get("efforts") or []
+        variants = [render_model(entry, e)[0] for e in efforts] if "{effort}" in entry["model"] else [entry["model"]]
+        if spec["model"] not in variants:
+            continue
+        if not effort:
+            return spec, spec.get("effort")
+        if efforts and effort not in efforts:
+            raise CrewError(f"{key} ({spec['backend']}:{spec['model']}) takes effort {' | '.join(efforts)}, not '{effort}'")
+        if not efforts:
+            return spec, None
+        model, cli_effort = render_model(entry, effort)
+        return dict(spec, model=model, effort=cli_effort), cli_effort
+    return spec, effort
 
 
 def backend_cmd(cfg: dict, backend: str):
@@ -1262,6 +1343,7 @@ def cmd_run(args) -> int:
     caller = resolve_caller(args.caller)
     if not args.role:
         raise CrewError("--role is required (or --resume <taskdir>)")
+    args.role = (cfg.get("role_names") or {}).get(args.role, args.role)
     roles = cfg.get("roles") or {}
     role_cfg = roles.get(args.role)
     if role_cfg is None:
@@ -1377,7 +1459,7 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
         spec["model"] = args.model
     request_text = text
     backend = spec["backend"]
-    effort = args.effort or spec.get("effort") or role_cfg.get("effort")
+    spec, effort = settle_effort(cfg, spec, args.effort or spec.get("effort") or role_cfg.get("effort"))
     top = git_top(cwd)
     agy_fetch = backend == "agy" and scope["web"] and agy_fetch_allowed(cfg)
     enf = enforcement(backend, scope, bool(top), agy_fetch)
@@ -1668,46 +1750,86 @@ def cmd_roles(args) -> int:
     for name, ref in (cfg.get("agents") or {}).items():
         print(f"  {name:<18} {json.dumps(ref)}  ->  {describe_agent(cfg, name)}")
     print("\nRoles:")
+    other_names = {}
+    for alias, role in (cfg.get("role_names") or {}).items():
+        other_names.setdefault(role, []).append(alias)
     for name, r in (cfg.get("roles") or {}).items():
         balance = bool(r.get("balance"))
+        if other_names.get(name):
+            print(f"  {name:<18} (also called: {', '.join(other_names[name])})")
         print(f"  {name:<18} agent={json.dumps(r.get('agent'))} -> {describe_agent(cfg, r.get('agent'), caller, balance)}")
         print(f"  {'':<18} access={r.get('access', 'read')} web={on_off(r.get('web'))} "
               f"network={on_off(r.get('network'))}{' mode=review' if r.get('mode') == 'review' else ''}"
               f"{' balance=on' if balance else ''}")
         if r.get("about"):
             print(f"  {'':<18} {r['about']}")
+    print("\nName a model for one task with --agent, e.g. --agent gemini-flash@medium; `crew.py models` lists them.")
     return 0
+
+
+def catalogue_rows(cfg: dict) -> list:
+    rows = []
+    for key, entry in catalogue(cfg).items():
+        efforts = entry.get("efforts") or []
+        shown = ", ".join(f"*{e}" if e == entry.get("default_effort") else e for e in efforts) or "-"
+        model = entry["model"].replace("{effort}", "<effort>")
+        rows.append((key, entry["backend"], model, shown, entry.get("about", "")))
+    return rows
 
 
 def cmd_models(args) -> int:
     cfg = load_config()
+    print("Models crew knows by name. Use one as --agent <name>[@effort], e.g. --agent gemini-flash@medium,")
+    print("or --agent \"gemini flash\" --effort medium. * marks the default effort.\n")
+    rows = catalogue_rows(cfg)
+    widths = [max(len(r[i]) for r in rows + [("name", "cli", "model id", "effort", "")]) for i in range(4)]
+    print(f"  {'name':<{widths[0]}}  {'cli':<{widths[1]}}  {'model id':<{widths[2]}}  {'effort':<{widths[3]}}  good for")
+    for r in rows:
+        print(f"  {r[0]:<{widths[0]}}  {r[1]:<{widths[1]}}  {r[2]:<{widths[2]}}  {r[3]:<{widths[3]}}  {r[4]}")
+    print("\nOther names that work:")
+    for key, entry in catalogue(cfg).items():
+        if entry.get("names"):
+            print(f"  {key:<{widths[0]}}  {', '.join(entry['names'])}")
+    if args.offline:
+        return 0
+
+    print("\nChecked against the installed CLIs:")
+    offered = {}
     cm = codex_models()
-    print("codex (from the local model cache; run codex once to refresh it):")
-    if cm is None:
-        print("  (no cache found at " + str(codex_home() / "models_cache.json") + ")")
-    for m in cm or []:
-        efforts = ",".join(e.get("effort", "") for e in m.get("supported_reasoning_levels") or [])
-        print(f"  codex:{m.get('slug'):<22} {m.get('description', '')}  [effort: {efforts}]")
-    print("\nclaude (short aliases, or full model ids such as claude:claude-haiku-5-5):")
-    if backend_cmd(cfg, "claude"):
-        for alias in CLAUDE_ALIASES:
-            print(f"  claude:{alias}")
-        print("  [effort: low,medium,high,xhigh,max]")
-        print("  Aliases are resolved by your claude CLI and can lag a release (claude 2.1.286 still maps\n"
-              "  haiku to Haiku 4.5). Each run records the model that actually ran as resolved_model.")
-    else:
-        print("  (claude not installed)")
-    print("\nagy (from `agy models`):")
-    am = agy_models(cfg)
-    if am is None:
-        print("  (agy not installed or not responding)")
-    for m in am or []:
-        print(f"  agy:{m['slug']:<26} {m['description']}")
+    if cm is not None:
+        offered["codex"] = {m.get("slug") for m in cm}
+    am = agy_models(cfg) if backend_cmd(cfg, "agy") else None
+    if am is not None:
+        offered["agy"] = {m["slug"] for m in am}
+    for backend in BACKENDS:
+        if not backend_cmd(cfg, backend):
+            print(f"  {backend}: not installed, so its models above can't be used")
+            continue
+        if backend not in offered:
+            how = {"codex": f"no model cache at {codex_home() / 'models_cache.json'}; run codex once",
+                   "claude": "claude has no model list command; each run records the model that actually ran",
+                   "agy": "`agy models` did not answer"}[backend]
+            print(f"  {backend}: installed; {how}")
+            continue
+        have = offered[backend]
+        known = set()
+        for key, entry in catalogue(cfg).items():
+            if entry["backend"] != backend:
+                continue
+            ids = ([render_model(entry, e)[0] for e in entry.get("efforts") or []]
+                   if "{effort}" in entry["model"] else [entry["model"]])
+            known.update(ids)
+            if not any(i in have for i in ids):
+                print(f"  {backend}: {key} ({entry['model']}) is not offered by your {backend}")
+        extra = sorted(m for m in have if m and m not in known)
+        print(f"  {backend}: installed; offers {len(have)} model id(s)"
+              + (f"; not in the list above (use {backend}:<id>): {', '.join(extra)}" if extra else ""))
     return 0
 
 
 def cmd_set_role(args) -> int:
     cfg = load_config()
+    args.role = (cfg.get("role_names") or {}).get(args.role, args.role)
     user = load_user_config()
     roles = user.setdefault("roles", {})
     if args.reset:
@@ -2914,7 +3036,9 @@ def build_parser() -> argparse.ArgumentParser:
     ro = sub.add_parser("roles", help="show roles, aliases and which agent each resolves to")
     ro.add_argument("--caller", choices=callers)
     ro.set_defaults(func=cmd_roles)
-    sub.add_parser("models", help="list the models each installed backend offers").set_defaults(func=cmd_models)
+    mo = sub.add_parser("models", help="models by name, their efforts, and which ones your CLIs offer")
+    mo.add_argument("--offline", action="store_true", help="only print crew's list; don't ask the CLIs")
+    mo.set_defaults(func=cmd_models)
 
     sr = sub.add_parser("set-role", help="choose the agent and default scope for a role (saved in your config)")
     sr.add_argument("role")
