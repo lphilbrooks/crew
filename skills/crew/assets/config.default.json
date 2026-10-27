@@ -1,5 +1,5 @@
 {
-  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed. Claude agents use full model ids, because Claude Code's short aliases can lag a release (claude 2.1.286 still maps 'haiku' to Haiku 4.5).",
+  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. An agent is backend[+provider]:model[@effort]: codex, claude, agy, opencode (opencode:<provider>/<model>), api (api:<provider>/<model>), or a command-line agent you define under backends.<name>.command. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed. Claude agents use full model ids, because Claude Code's short aliases can lag a release (claude 2.1.286 still maps 'haiku' to Haiku 4.5).",
 
   "view": "auto",
   "hold": true,
@@ -22,7 +22,29 @@
     "agy": {
       "exe": null,
       "settings": "~/.gemini/antigravity-cli/settings.json"
+    },
+    "opencode": {
+      "exe": null
     }
+  },
+
+  "_providers_doc": "Model APIs. api agents call them directly (api:<provider>/<model>, read-only, no tools). claude+<provider>:<model> needs anthropic_url, codex+<provider>:<model> needs responses. Keys come from the key_env variable or `crew.py set-key <provider>`. family is used when the model name doesn't say. Add your own (vLLM, LiteLLM, a company gateway) the same way.",
+  "providers": {
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY", "anthropic_url": "https://openrouter.ai/api", "responses": true, "effort_style": "openrouter", "body": {"usage": {"include": true}}, "headers": {"X-Title": "crew"}, "quota": "openrouter"},
+    "openai": {"base_url": "https://api.openai.com/v1", "key_env": "OPENAI_API_KEY", "responses": true, "effort_style": "openai", "family": "openai"},
+    "anthropic": {"base_url": "https://api.anthropic.com/v1", "key_env": "ANTHROPIC_API_KEY", "family": "anthropic"},
+    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "key_env": "GEMINI_API_KEY", "effort_style": "openai", "family": "google"},
+    "deepseek": {"base_url": "https://api.deepseek.com/v1", "key_env": "DEEPSEEK_API_KEY", "anthropic_url": "https://api.deepseek.com/anthropic", "family": "deepseek"},
+    "moonshot": {"base_url": "https://api.moonshot.ai/v1", "key_env": "MOONSHOT_API_KEY", "anthropic_url": "https://api.moonshot.ai/anthropic", "family": "moonshot"},
+    "zai": {"base_url": "https://api.z.ai/api/paas/v4", "key_env": "ZAI_API_KEY", "anthropic_url": "https://api.z.ai/api/anthropic", "family": "zhipu"},
+    "xai": {"base_url": "https://api.x.ai/v1", "key_env": "XAI_API_KEY", "family": "xai"},
+    "mistral": {"base_url": "https://api.mistral.ai/v1", "key_env": "MISTRAL_API_KEY", "family": "mistral"},
+    "groq": {"base_url": "https://api.groq.com/openai/v1", "key_env": "GROQ_API_KEY"},
+    "cerebras": {"base_url": "https://api.cerebras.ai/v1", "key_env": "CEREBRAS_API_KEY"},
+    "together": {"base_url": "https://api.together.xyz/v1", "key_env": "TOGETHER_API_KEY"},
+    "fireworks": {"base_url": "https://api.fireworks.ai/inference/v1", "key_env": "FIREWORKS_API_KEY"},
+    "ollama": {"base_url": "http://localhost:11434/v1", "key_env": null, "anthropic_url": "http://localhost:11434", "responses": true},
+    "lmstudio": {"base_url": "http://localhost:1234/v1", "key_env": null}
   },
 
   "agents": {

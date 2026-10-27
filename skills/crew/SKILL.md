@@ -3,19 +3,21 @@ name: crew
 description: >-
   Split work across coding agents from other vendors: break a request into pieces (code review,
   second opinions, implementation, web research, summarising) and send them, several at once if
-  they're independent, to OpenAI Codex (`codex`), Anthropic Claude Code (`claude`) or Google
-  Antigravity (`agy`), then check and combine the results. Works from any of them, so Claude can
-  ask Codex for a review and Codex can ask Claude. Each task gets its own permission scope (file access, web,
+  they're independent, to OpenAI Codex (`codex`), Anthropic Claude Code (`claude`), Google
+  Antigravity (`agy`), OpenCode (`opencode`, any provider it supports) or a model API directly
+  (`api`: OpenRouter, DeepSeek, Groq, Ollama and other OpenAI-compatible providers), then check and
+  combine the results. Works from any of them, so Claude can ask Codex for a review and Codex can
+  ask Claude. Each task gets its own permission scope (file access, web,
   network) and every run is recorded on disk. Use only when the user explicitly asks to involve
   another agent, e.g. "/crew", "have codex review this", "get claude's opinion on this", "ask
   gemini to look this up", "delegate this to codex".
 license: MIT (see LICENSE)
 compatibility: >-
-  Requires Python 3.9+ and git, plus at least one of the codex, claude or agy CLIs installed and
-  signed in, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
+  Requires Python 3.9+ and git, plus at least one of the codex, claude, agy or opencode CLIs
+  installed and signed in, or an API key for a provider such as OpenRouter, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
 ---
 
 # crew
@@ -32,7 +34,9 @@ The script is `scripts/crew.py` in this skill's folder (Python 3.9+). Run it wit
 ## Before the first task
 
 1. Always pass `--caller` with your own name (`codex`, `claude` or `agy`). crew then skips your
-   vendor, so the user gets a second opinion from a different model family.
+   model family, so the user gets a second opinion from a different one. From OpenCode, pass your
+   model too, e.g. `--caller opencode:openrouter/anthropic/claude-sonnet-5-5`, since OpenCode can
+   run any family.
 2. Run `crew.py roles --caller <you>` to see which agent each role will use. If one says
    `NOT INSTALLED` or `INVALID`, run `crew.py doctor` and show the user the output. Don't change
    the user's config unless they ask.
@@ -70,9 +74,13 @@ Give each task the least it needs. Flags override the role's defaults for one ca
   dependencies (Codex and Claude only).
 
 crew prints how each limit is enforced, and refuses scopes a backend can't honour (agy can't
-`verify`).
+`verify`; `api` agents can't `write` or use the web).
 - Codex's sandbox is a hard limit.
 - Claude's tool list is a hard limit, and so is its sandbox on macOS and Linux.
+- OpenCode's permission rules are a hard limit on its tools, but its shell has no sandbox: in
+  `verify`, repository writes and network are instructions plus a git check.
+- `api` agents have no tools at all: they see only the task text, so put everything they need in
+  it (reviews embed the diff automatically).
 - agy's file limits, and Claude's shell on native Windows, are instructions plus a git check.
 
 See [references/permissions.md](references/permissions.md).
@@ -81,7 +89,7 @@ Other options:
 
 | Option | Does |
 |---|---|
-| `--agent <alias or spec>` | use a specific agent, e.g. `codex:gpt-6.1-sol@high` (always honoured) |
+| `--agent <alias or spec>` | use a specific agent, e.g. `codex:gpt-6.1-sol@high`, `opencode:openrouter/<model>`, `api:openrouter/<model>` or `claude+openrouter:<model>` (always honoured) |
 | `--model`, `--effort` | override the model or reasoning effort |
 | `--view hidden\|tab` | hidden, or in a terminal tab |
 | `--no-hold` | close the tab when the task finishes |
@@ -130,8 +138,9 @@ It exits 0 for ok, 2 for any other status, 3 if the wait timed out and 1 for usa
 
 ## Follow-ups
 
-For Codex and Claude, `crew.py run --resume <run folder> --task "<what to change>" --wait`
-continues the same session with the same scope.
+For Codex, Claude, OpenCode and `api` agents,
+`crew.py run --resume <run folder> --task "<what to change>" --wait` continues the same session
+with the same scope.
 
 ## Writing tasks and checking results
 
@@ -147,5 +156,6 @@ continues the same session with the same scope.
 ## Privacy
 
 The task, and any files the agent reads, go to that vendor under the user's plan and its data
-terms. Check the user is happy with that before sending private material. Never put secrets in a
+terms. With OpenRouter (or OpenCode set up with it) the task also goes to whichever company hosts
+the model. Check the user is happy with that before sending private material. Never put secrets in a
 task, because run folders under `~/.crew/runs/` keep a copy.

@@ -71,10 +71,10 @@ class Sandbox(unittest.TestCase):
                 time.sleep(0.5)
         self.tmp.cleanup()
 
-    def crew(self, *args, mode="ok", **extra_env):
+    def crew(self, *args, mode="ok", input_text=None, **extra_env):
         env = dict(self.env, FAKE_MODE=mode, **extra_env)
         r = subprocess.run([sys.executable, str(CREW), *args], capture_output=True, text=True,
-                           encoding="utf-8", env=env, timeout=180)
+                           encoding="utf-8", env=env, timeout=180, input=input_text)
         return r.returncode, r.stdout + r.stderr
 
     def task_dir(self, out):
@@ -94,8 +94,9 @@ class TestSpecs(unittest.TestCase):
                          {"backend": "codex", "model": "gpt-6.1-sol", "effort": "high"})
         self.assertEqual(crew.parse_spec("agy:gemini-3.8-flash-medium")["effort"], None)
         self.assertEqual(crew.parse_spec("claude:opus@max")["backend"], "claude")
-        self.assertIsNone(crew.parse_spec("gemini:flash"))
         self.assertIsNone(crew.parse_spec("nonsense"))
+        with self.assertRaises(crew.CrewError):  # well formed, but no such backend
+            crew.expand_agent({}, "gemini:flash")
 
     def test_aliases_and_fallback(self):
         cfg = {"agents": {"a": ["agy:m1", "b"], "b": "codex:m2@low"}}

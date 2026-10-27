@@ -7,17 +7,18 @@ refuses a scope the backend can't honour.
 Contents: [the table](#how-each-setting-is-enforced) · [git check](#the-git-check) · [fact check](#the-fact-check) ·
 [scratch folder](#scratch-folder) · [isolation](#isolation) ·
 [sandboxed callers](#calling-crew-from-a-sandbox) · [Codex](#codex) · [Claude](#claude) ·
-[agy](#agy)
+[agy](#agy) · [OpenCode](#opencode) · [api agents](#api-agents) · [other providers](#claude-and-codex-on-other-providers) ·
+[your own CLI](#command-line-agents-from-the-config)
 
 ## How each setting is enforced
 
-| | Codex | Claude | agy |
-|---|---|---|---|
-| `read` | read-only sandbox (**hard**) | tools limited to Read, Glob, Grep (**hard**) | instructions + git check |
-| `verify` | workspace-write sandbox, scratch folder writable, + git check | shell but no Edit/Write. Mac/Linux: sandbox with the repo read-only (**hard**). Windows: instructions + git check | refused: agy can't run commands headless |
-| `write` | workspace-write sandbox (**hard**) | Edit/Write + shell, sandboxed on Mac/Linux | accept-edits mode; commands stay denied |
-| `--web` | `web_search` live or disabled (**hard**) | WebSearch/WebFetch in or out of the tool list (**hard**) | search always on; reading pages needs `read_url(*)` in agy's settings |
-| `--network` | sandbox network on or off (**hard**) | sandbox domain allowlist on Mac/Linux; not enforced on Windows | n/a |
+| | Codex | Claude | agy | OpenCode | api |
+|---|---|---|---|---|---|
+| `read` | read-only sandbox (**hard**) | tools limited to Read, Glob, Grep (**hard**) | instructions + git check | edit and bash denied (**hard**) | no tools (**hard**) |
+| `verify` | workspace-write sandbox, scratch folder writable, + git check | shell but no Edit/Write. Mac/Linux: sandbox with the repo read-only (**hard**). Windows: instructions + git check | refused: agy can't run commands headless | bash allowed, edit denied; shell writes: instructions + git check | runs read-only (it can't build or test) |
+| `write` | workspace-write sandbox (**hard**) | Edit/Write + shell, sandboxed on Mac/Linux | accept-edits mode; commands stay denied | edit and bash allowed | refused |
+| `--web` | `web_search` live or disabled (**hard**) | WebSearch/WebFetch in or out of the tool list (**hard**) | search always on; reading pages needs `read_url(*)` in agy's settings | webfetch/websearch allowed or denied (**hard**) | refused |
+| `--network` | sandbox network on or off (**hard**) | sandbox domain allowlist on Mac/Linux; not enforced on Windows | n/a | not enforced: instructions only | n/a |
 
 **Hard** means the tool itself blocks the action. Everything else relies on the agent following
 instructions, with crew's git check catching changes afterwards.
@@ -126,3 +127,70 @@ On Windows, Codex's sandbox runs commands as a separate user that has none of yo
   the only limit, so run agy tasks inside git repositories.
 - agy prints nothing until it finishes. Long research can leave a blank tab for 15 minutes. Its
   logs are in `~/.gemini/antigravity-cli/log/`.
+
+## OpenCode
+
+- crew runs `opencode run --format json -m <provider>/<model>` and passes the scope as an inline
+  config (`OPENCODE_CONFIG_CONTENT`, and the permission block as `OPENCODE_PERMISSION`). Inline
+  config outranks your global and project `opencode.json`. A copy is kept in
+  `<run folder>/opencode-config.json`.
+- The rules start from `"*": "deny"`, so any tool crew doesn't name (MCP tools, subagents) is
+  denied rather than left to an approval prompt a headless run can't answer. Read, search and
+  todo tools are always allowed; `edit`, `bash`, `external_directory`, `webfetch` and `websearch`
+  follow the scope. A denied call shows up in `denied_tools`.
+- Session sharing is turned off for crew's runs (`"share": "disabled"`).
+- OpenCode has no sandbox for its shell, so in `verify` and `write` a command can write anywhere
+  and reach the network. The git check reports repository changes afterwards.
+- Effort is passed with `--variant` when your opencode has that flag; otherwise crew says so and
+  leaves it out. Long tasks are attached with `--file` when supported.
+- OpenCode keeps its own provider logins (`opencode auth login`), so crew never sees those keys.
+
+## api agents
+
+- `api:<provider>/<model>` sends the task straight to an OpenAI-compatible
+  `/chat/completions` endpoint from crew's own runner. The model gets no tools: it can't read
+  files, run commands or browse, which makes every scope trivially enforced. `write` and `--web`
+  are refused; `verify` runs read-only.
+- Reviews embed the diff, as for agy. For other roles, put what the model needs in the task.
+- The key comes from the provider's variable (e.g. `OPENROUTER_API_KEY`) or from
+  `~/.crew/keys.json` (`crew.py set-key <provider>`; the file is readable by you only). It is
+  added to the request at run time and never written to `cmd.json`.
+- `--resume` replays the earlier conversation (`conversation.json` in the run folder).
+- If a provider rejects crew's optional fields (`stream_options`, the effort setting), crew retries
+  once with a minimal request and notes it.
+
+## Claude and Codex on other providers
+
+- `claude+<provider>:<model>` sets `ANTHROPIC_BASE_URL` to the provider's Anthropic-compatible
+  endpoint, `ANTHROPIC_AUTH_TOKEN` to its key, and `ANTHROPIC_API_KEY` to empty. It also points
+  Claude Code's helper and subagent models at the same model, so nothing is sent to Anthropic's
+  model names. All of Claude's scope controls still apply.
+- `codex+<provider>:<model>` adds a `model_providers` entry with `wire_api = "responses"`, so the
+  provider needs a Responses API (`"responses": true` in its config). The Codex sandbox applies.
+- The key is passed in the environment at run time, never written to `cmd.json`.
+- Usage limits and credit are tracked per provider, not against your Claude or Codex plan.
+- Claude Code is built for Anthropic's models; other models may handle its tools less well.
+
+## Command-line agents from the config
+
+A CLI crew doesn't know can be added under `backends.<name>`:
+
+```json
+"backends": {
+  "mycli": {
+    "command": ["mycli", "--model", "{model}", "-p", "{prompt}"],
+    "effort_args": ["--effort", "{effort}"],
+    "access": ["read", "write"],
+    "access_args": {"write": ["--auto-approve-edits"]},
+    "web_args": ["--web"],
+    "family": "mycompany",
+    "enforcement": {"write": "mycli's auto-approve-edits mode"}
+  }
+}
+```
+
+- `{prompt}` puts the task on the command line (long tasks become a pointer to `task.md`);
+  without `{prompt}` or `{task_file}`, the task goes to stdin. `{cwd}` and `{scratch}` work too.
+- `access` lists the levels the CLI may be given (default `read` only); others are refused.
+- Output is shown and kept as plain text. Unless `enforcement` says otherwise, crew reports every
+  limit as instructions plus the git check, because it can't know what the CLI enforces.
