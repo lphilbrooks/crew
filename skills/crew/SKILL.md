@@ -96,6 +96,8 @@ Other options:
 | `--slug` | name the run folder |
 | `--max-minutes` | kill the agent after this long |
 | `--panel [N]` | send the task to N agents (default 2) from different model families at once |
+| `--worktree` | run in a new git worktree from HEAD; kept with its branch if the agent changed files. Use it for parallel `write` tasks |
+| `--stall-minutes`, `--max-cost` | stop a silent agent; cap (Claude) or flag (others) the cost of a run |
 
 **Panels.** For research where being wrong is costly, `--panel` asks agents from two model
 families the same question. Their mistakes rarely overlap, so read where they disagree and check
@@ -113,7 +115,8 @@ Quick lookups can run in the foreground with `--wait`. Reviews and implementatio
 keep working. If a wait times out, `crew.py collect <run folder>` picks the task up again.
 
 Independent tasks can run in parallel. Parallel `write` tasks in one repository must touch
-different files, and each task must say which.
+different files, and each task must say which, unless each runs with `--worktree`. A kept worktree
+holds the change on branch `crew/<run>`: review it there, then bring it into the user's checkout.
 
 `--wait` prints the status, the scope, any violations or changed files, and the agent's answer.
 After a task with web access, it also lists any cited URL that failed and any package version
@@ -135,6 +138,7 @@ It exits 0 for ok, 2 for any other status, 3 if the wait timed out and 1 for usa
 | `timeout` | killed at `--max-minutes` |
 | `harness-error` | crew's runner failed or was closed |
 | `limited` | the vendor's usage limit was hit; `note` says whether it was sent on to another agent |
+| `stalled` | killed after printing nothing for `--stall-minutes` |
 
 ## Follow-ups
 

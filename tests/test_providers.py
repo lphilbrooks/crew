@@ -7,6 +7,8 @@ Run from the repo root:  python -m unittest tests.test_providers -v
 """
 import http.server
 import json
+import os
+import subprocess
 import sys
 import threading
 import unittest
@@ -171,7 +173,8 @@ class FakeAPI(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.endswith("/models"):
-            self.reply(200, {"data": [{"id": "fake/model-b"}, {"id": "fake/model-a"}]})
+            models = getattr(self.server, "models", ["fake/model-b", "fake/model-a"])
+            self.reply(200, {"data": [{"id": m} for m in models]})
         else:
             self.reply(404, {})
 
@@ -220,7 +223,10 @@ class ProviderSandbox(Sandbox):
         cfg["providers"] = {"local": {"base_url": base, "key_env": "CREW_TEST_API_KEY"},
                             "router": {"base_url": base, "key_env": "CREW_TEST_API_KEY",
                                        "anthropic_url": "http://127.0.0.1:1/anthropic"},
-                            "keyless": {"base_url": base, "key_env": None, "responses": True}}
+                            "keyless": {"base_url": base, "key_env": None, "responses": True},
+                            "apikey": {"base_url": None, "key_env": "CREW_TEST_API_KEY",
+                                       "anthropic_url": "http://127.0.0.1:1/coding/", "auth_env": "ANTHROPIC_API_KEY"},
+                            "narrow": {"base_url": base, "key_env": None, "allowed_models": ["ok-model"]}}
         (self.home / "config.json").write_text(json.dumps(cfg))
         self.env["NO_PROXY"] = self.env["no_proxy"] = "127.0.0.1,localhost"
         self.env.pop("CREW_TEST_API_KEY", None)
@@ -377,3 +383,176 @@ class TestCommandBackend(ProviderSandbox):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOpencodeFixes(ProviderSandbox):
+    """OpenCode 2's shared server, effort variants, PWD, stdin prompts and private databases."""
+
+    def test_v2_standalone_and_effort_variant(self):
+        rc, out = self.crew("run", "--role", "light", "--cd", str(self.repo / "sub"), "--wait", "--agent",
+                            "opencode:openrouter/x/y@high", "--task", "hello", FAKE_OPENCODE_VERSION="2.0.31")
+        self.assertEqual(rc, 0, out)
+        self.assertIn('"run", "--standalone", "--format", "json", "-m", "openrouter/x/y#high"', out)
+        self.assertNotIn("--variant", out)
+        self.assertIn(f"pwd={self.repo / 'sub'}", out)
+        self.assertIn("private --standalone server", json.dumps(self.cmd(out)["enforcement"]))
+
+    def test_v1_prompt_on_stdin(self):
+        rc, out = self.run_task("--agent", "opencode:a/b", "--task", "-starts with a dash\nand has two lines")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("--standalone", out)
+        cmd = self.cmd(out)
+        self.assertTrue(cmd["stdin"])
+        self.assertNotIn("two lines", " ".join(cmd["argv"]))
+        self.assertNotIn("prompt_chars=0", out)
+
+    def test_private_db_follows_resume(self):
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg["backends"]["opencode"]["private_db"] = True
+        (self.home / "config.json").write_text(json.dumps(cfg))
+        rc, out = self.run_task("--agent", "opencode:a/b", "--task", "x")
+        self.assertIn("db=True", out)
+        first = self.cmd(out)["opencode_db"]
+        self.assertTrue(first.startswith(str(self.task_dir(out))))
+        rc, again = self.crew("run", "--resume", str(self.task_dir(out)), "--task", "more", "--wait")
+        self.assertEqual(rc, 0, again)
+        self.assertEqual(self.cmd(again)["opencode_db"], first)
+
+
+class TestCodexIsolation(ProviderSandbox):
+    def test_mcp_servers_disabled_by_name(self):
+        rc, out = self.run_task("--agent", "codex:m", "--task", "x")
+        self.assertEqual(rc, 0, out)
+        argv = self.cmd(out)["argv"]
+        self.assertIn("features.plugins=false", argv)
+        self.assertIn("mcp_servers.docs.enabled=false", argv)
+        self.assertNotIn("mcp_servers.off.enabled=false", argv)
+        self.assertIn("1 codex MCP server(s) disabled", self.cmd(out)["enforcement"]["mcp"])
+
+    def test_listing_failure_is_reported(self):
+        rc, out = self.run_task("--agent", "codex:m", "--task", "x", FAKE_CODEX_MCP="fail")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("could not list your codex MCP servers", self.cmd(out)["enforcement"]["mcp"])
+
+    def test_unsafe_server_name_refused(self):
+        rc, out = self.run_task("--agent", "codex:m", "--task", "x",
+                                FAKE_CODEX_MCP='[{"name": "a.b", "enabled": true}]')
+        self.assertEqual(rc, 1)
+        self.assertIn("can't be disabled safely", out)
+
+
+class TestWindowsShim(unittest.TestCase):
+    def test_npm_shim_target(self):
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+            script.parent.mkdir(parents=True)
+            script.write_text("")
+            shim = Path(tmp) / "codex.cmd"
+            shim.write_text('@ECHO off\r\nSET "_prog=node"\r\n'
+                            'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & '
+                            '"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n')
+            node = shutil.which("node")
+            expected = [node, os.path.normpath(str(script))] if node else None
+            self.assertEqual(crew.windows_shim_target(str(shim)), expected)
+            exe = Path(tmp) / "tool.exe"
+            exe.write_text("")
+            (Path(tmp) / "tool.cmd").write_text('@"%~dp0\\tool.exe" %*\r\n')
+            self.assertEqual(crew.windows_shim_target(str(Path(tmp) / "tool.cmd")), [os.path.normpath(str(exe))])
+            (Path(tmp) / "odd.cmd").write_text("@echo hi\r\n")
+            self.assertIsNone(crew.windows_shim_target(str(Path(tmp) / "odd.cmd")))
+
+
+class TestProviderSettings(ProviderSandbox):
+    def test_auth_env_carries_the_key(self):
+        rc, out = self.run_task("--agent", "claude+apikey:kimi-k3", "--task", "x", CREW_TEST_API_KEY="sk-k")
+        self.assertEqual(rc, 0, out)
+        self.assertIn('"ANTHROPIC_AUTH_TOKEN": false', out)
+        self.assertIn('"ANTHROPIC_API_KEY": true', out)
+        self.assertEqual(self.cmd(out)["secret_env"], {"ANTHROPIC_API_KEY": "CREW_TEST_API_KEY"})
+
+    def test_api_needs_base_url(self):
+        rc, out = self.run_task("--agent", "api:apikey/m", "--task", "x", CREW_TEST_API_KEY="sk-k")
+        self.assertEqual(rc, 1)
+        self.assertIn("no OpenAI-compatible endpoint", out)
+
+    def test_allowed_models(self):
+        rc, out = self.run_task("--agent", "api:narrow/other", "--task", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("not in providers.narrow.allowed_models", out)
+        rc, out = self.run_task("--agent", "api:narrow/ok-model", "--task", "x")
+        self.assertEqual(rc, 0, out)
+
+    def test_same_model_through_another_provider_on_limit(self):
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg["roles"] = {"duo": {"agent": ["claude:claude-opus-5-5", "claude+router:anthropic/claude-opus-5-5"],
+                                "access": "read"}}
+        (self.home / "config.json").write_text(json.dumps(cfg))
+        rc, out = self.crew("run", "--role", "duo", "--cd", str(self.repo), "--task", "x", "--wait",
+                            FAKE_LIMITED="claude-direct", CREW_TEST_API_KEY="sk-r")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cmd(out)["agent"], "claude+router:anthropic/claude-opus-5-5")
+
+
+class TestRunControls(ProviderSandbox):
+    def test_worktree_kept_with_changes(self):
+        rc, out = self.run_task("--agent", "codex:m", "--access", "write", "--worktree", "--task", "x", mode="touch")
+        self.assertEqual(rc, 0, out)
+        wt = self.result(out)["worktree"]
+        self.assertTrue(wt["kept"])
+        self.assertTrue((Path(wt["path"]) / "touched-by-agent.txt").exists())
+        self.assertFalse((self.repo / "touched-by-agent.txt").exists())
+        self.assertIn(wt["branch"], subprocess.run(["git", "-C", str(self.repo), "branch"], capture_output=True,
+                                                   text=True).stdout)
+        self.assertIn("merge or cherry-pick", out)
+
+    def test_worktree_removed_without_changes(self):
+        rc, out = self.run_task("--agent", "codex:m", "--worktree", "--task", "x")
+        self.assertEqual(rc, 0, out)
+        wt = self.result(out)["worktree"]
+        self.assertFalse(wt["kept"])
+        self.assertFalse(Path(wt["path"]).exists())
+        self.assertNotIn(wt["branch"], subprocess.run(["git", "-C", str(self.repo), "branch"], capture_output=True,
+                                                      text=True).stdout)
+
+    def test_worktree_refused_for_reviews(self):
+        rc, out = self.crew("run", "--role", "review", "--agent", "codex:m", "--cd", str(self.repo), "--worktree")
+        self.assertEqual(rc, 1)
+        self.assertIn("doesn't apply to reviews", out)
+
+    def test_stall_kills_a_silent_agent(self):
+        rc, out = self.run_task("--agent", "plain:m", "--stall-minutes", "0.05", "--task", "x", mode="stall")
+        r = self.result(out)
+        self.assertEqual(r["status"], "stalled", out)
+        self.assertLess(r["seconds"], 60)
+
+    def test_cost_cap(self):
+        rc, out = self.run_task("--agent", "claude:m", "--max-cost", "0.001", "--task", "x",
+                                FAKE_CLAUDE_HELP="--max-budget-usd <amount>")
+        self.assertIn('"--max-budget-usd", "0.001"', json.dumps(self.cmd(out)["argv"]))
+        self.assertIn("over max_cost_usd", self.result(out)["note"])
+        rc, out = self.run_task("--agent", "codex:m", "--max-cost", "1", "--task", "x")
+        self.assertIn("not enforced by codex", self.cmd(out)["enforcement"]["cost"])
+
+
+class TestDoctorAndModels(ProviderSandbox):
+    def test_doctor_ask(self):
+        cfg = json.loads((self.home / "config.json").read_text())
+        cfg["agents"] = {"one": "codex:m1", "two": "api:keyless/m2"}
+        cfg["roles"] = {"light": {"agent": ["one"], "access": "read"}}
+        (self.home / "config.json").write_text(json.dumps(cfg))
+        rc, out = self.crew("doctor", "--ask")
+        self.assertIn("[ok  ] ask codex:m1", out)
+        self.assertIn("[ok  ] ask api:keyless/m2", out)
+        self.assertNotIn("FAIL] ask", out)
+
+    def test_model_changes(self):
+        rc, out = self.crew("models", "--changes")
+        self.assertIn("recorded", out)
+        rc, out = self.crew("models", "--changes")
+        self.assertIn("no model changes", out)
+        self.server.models = ["fake/model-a", "fake/model-c"]
+        rc, out = self.crew("models", "--changes")
+        self.assertIn("provider:keyless: + fake/model-c", out)
+        self.assertIn("provider:keyless: - fake/model-b", out)

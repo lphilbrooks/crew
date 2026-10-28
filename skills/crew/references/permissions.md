@@ -92,6 +92,12 @@ On Windows, Codex's sandbox runs commands as a separate user that has none of yo
 
 ## Codex
 
+- Codex runs MCP tools outside its shell sandbox, so a read-only task could still change things
+  through one. crew turns plugins off (`features.plugins=false`) and disables each MCP server your
+  codex config enables, by name (`mcp_servers.<name>.enabled=false`, from `codex mcp list --json`).
+  `cmd.json` → `enforcement.mcp` says what was done. If the list can't be read, the run goes ahead
+  and says so; `ignore_user_config` skips your config, servers included.
+
 - crew passes `--skip-git-repo-check`, so Codex works outside git repositories too.
 - A review with no task text uses `codex exec review`. That takes no prompt, so crew's scope note
   isn't sent; the sandbox and git check still apply.
@@ -130,10 +136,19 @@ On Windows, Codex's sandbox runs commands as a separate user that has none of yo
 
 ## OpenCode
 
-- crew runs `opencode run --format json -m <provider>/<model>` and passes the scope as an inline
-  config (`OPENCODE_CONFIG_CONTENT`, and the permission block as `OPENCODE_PERMISSION`). Inline
-  config outranks your global and project `opencode.json`. A copy is kept in
+- crew runs `opencode run --format json -m <provider>/<model>` with the task on stdin, and passes
+  the scope as an inline config (`OPENCODE_CONFIG_CONTENT`; 1.x also reads `OPENCODE_PERMISSION`).
+  Inline config outranks your global and project `opencode.json`. A copy is kept in
   `<run folder>/opencode-config.json`.
+- OpenCode 2 normally runs every session through one shared background server, which owns
+  configuration and permissions and ignores a run's own environment. crew therefore adds
+  `--standalone`, which gives the run a private server, so its permission rules apply.
+  OpenCode issue [#55076](https://github.com/anomalyco/opencode/issues/55076) reports that the
+  background service can resume a killed `--standalone` run without its permissions; crew kills
+  runs at `max_minutes` or `stall_minutes`, so consider `opencode service set disabled true` until
+  that is fixed.
+- `PWD` is set to the task's folder, since OpenCode takes its project from `PWD`, not the
+  process's working directory.
 - The rules start from `"*": "deny"`, so any tool crew doesn't name (MCP tools, subagents) is
   denied rather than left to an approval prompt a headless run can't answer. Read, search and
   todo tools are always allowed; `edit`, `bash`, `external_directory`, `webfetch` and `websearch`
@@ -141,8 +156,11 @@ On Windows, Codex's sandbox runs commands as a separate user that has none of yo
 - Session sharing is turned off for crew's runs (`"share": "disabled"`).
 - OpenCode has no sandbox for its shell, so in `verify` and `write` a command can write anywhere
   and reach the network. The git check reports repository changes afterwards.
-- Effort is passed with `--variant` when your opencode has that flag; otherwise crew says so and
-  leaves it out. Long tasks are attached with `--file` when supported.
+- Effort is sent as `provider/model#effort` on 2.x and with `--variant` on 1.x (when it has the
+  flag; otherwise crew says so and leaves it out).
+- `"backends": {"opencode": {"private_db": true}}` gives each run its own OpenCode database
+  (`OPENCODE_DB` in the run folder; `--resume` reuses it), so crew's sessions stay out of your own
+  history.
 - OpenCode keeps its own provider logins (`opencode auth login`), so crew never sees those keys.
 
 ## api agents
@@ -162,7 +180,9 @@ On Windows, Codex's sandbox runs commands as a separate user that has none of yo
 ## Claude and Codex on other providers
 
 - `claude+<provider>:<model>` sets `ANTHROPIC_BASE_URL` to the provider's Anthropic-compatible
-  endpoint, `ANTHROPIC_AUTH_TOKEN` to its key, and `ANTHROPIC_API_KEY` to empty. It also points
+  endpoint, `ANTHROPIC_AUTH_TOKEN` to its key, and `ANTHROPIC_API_KEY` to empty. A provider with
+  `"auth_env": "ANTHROPIC_API_KEY"` (Kimi's coding plan) gets the key in that variable instead,
+  with `ANTHROPIC_AUTH_TOKEN` removed. It also points
   Claude Code's helper and subagent models at the same model, so nothing is sent to Anthropic's
   model names. All of Claude's scope controls still apply.
 - `codex+<provider>:<model>` adds a `model_providers` entry with `wire_api = "responses"`, so the
@@ -194,3 +214,16 @@ A CLI crew doesn't know can be added under `backends.<name>`:
 - `access` lists the levels the CLI may be given (default `read` only); others are refused.
 - Output is shown and kept as plain text. Unless `enforcement` says otherwise, crew reports every
   limit as instructions plus the git check, because it can't know what the CLI enforces.
+
+## Run controls
+
+- `--worktree` creates `<run folder>/worktree` with `git worktree add -b crew/<run> ... HEAD` and
+  runs the agent there, so the scope's file limits and the git check apply to the worktree. It
+  holds committed files only, so it isn't offered for reviews. If the agent changed nothing, the
+  worktree and branch are removed; otherwise both are kept and the result names them.
+- `--stall-minutes` stops an agent that has printed nothing for that long (status `stalled`). It is
+  skipped for agy, which prints only when it has finished.
+- `--max-cost` is passed to Claude as `--max-budget-usd`, checked between turns. Other agents
+  can't be stopped on cost, so crew notes a run that went over.
+- On Windows, crew runs what an npm `.cmd` launcher points at (node and the script, or an `.exe`)
+  instead of the launcher, so cmd.exe never re-reads the arguments.

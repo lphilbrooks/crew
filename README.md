@@ -208,6 +208,13 @@ also reachable through OpenCode, OpenRouter or the `gemini` API provider.
   `crew.py models` lists what your opencode offers.
 - crew sets each task's permissions itself (see [`permissions.md`](skills/crew/references/permissions.md#opencode)).
   OpenCode has no shell sandbox, so `verify` limits are partly instructions plus crew's git check.
+- On OpenCode 2, crew runs each task on its own private server (`--standalone`), because the shared
+  background server ignores a run's own permission settings. A known OpenCode bug
+  ([#55076](https://github.com/anomalyco/opencode/issues/55076)) can let the background service
+  resume a killed run without those permissions; until it is fixed, consider
+  `opencode service set disabled true`, which makes private servers the default.
+- `"backends": {"opencode": {"private_db": true}}` keeps crew's sessions in each run folder instead
+  of your own OpenCode history.
 
 **Model APIs (OpenRouter and others):** give crew a key and it can call the API directly.
 
@@ -217,10 +224,16 @@ crew.py models --provider openrouter  # the model ids it offers
 crew.py set-agent or-deepseek api:openrouter/<model id>
 ```
 
-Built-in providers: `openrouter`, `openai`, `anthropic`, `gemini`, `deepseek`, `moonshot`, `zai`,
-`xai`, `mistral`, `groq`, `cerebras`, `together`, `fireworks`, and local `ollama` and `lmstudio` (no
-key). Add any other OpenAI-compatible endpoint (vLLM, LiteLLM, a company gateway) under
-`providers` in `~/.crew/config.json`.
+Built-in providers: `openrouter`, `openai`, `anthropic`, `gemini`, `deepseek`, `moonshot`, `kimi`
+(Kimi's coding plan, for `claude+kimi` only), `zai`, `xai`, `mistral`, `groq`, `cerebras`,
+`together`, `fireworks`, and local `ollama` and `lmstudio` (no key). Add any other OpenAI-compatible
+endpoint (vLLM, a company gateway) under `providers` in `~/.crew/config.json`, and limit a provider
+to certain models with `allowed_models`.
+
+A local gateway such as [LiteLLM](https://docs.litellm.ai) or
+[Claude Code Router](https://github.com/musistudio/claude-code-router) translates between API
+styles, so pointing a provider's `anthropic_url` (or `base_url`) at it lets `claude+<provider>`
+reach models whose own provider has no Anthropic-compatible endpoint.
 
 There are three ways to use a provider:
 
@@ -233,6 +246,15 @@ There are three ways to use a provider:
 Claude Code is built for Anthropic's models, and Codex for OpenAI's, so other models may use their
 tools less reliably. Keys stored with `set-key` live in `~/.crew/keys.json`, readable only by you;
 they reach the agent at run time and never appear in run folders.
+
+**The same model through another provider.** When a vendor's usage limit is hit, crew moves the
+task to the next agent in the role. Put the same model on another route next in line, and a Claude
+limit sends the task to Claude through OpenRouter instead of to a different model:
+
+```sh
+crew.py set-agent opus claude:claude-opus-5-5@high claude+openrouter:<OpenRouter's id for it>@high
+crew.py set-role check --agent opus codex-strong
+```
 
 **Any other command-line agent:** describe it under `backends` in your config and use it as
 `<name>:<model>`. See [`permissions.md`](skills/crew/references/permissions.md#command-line-agents-from-the-config).
@@ -255,6 +277,9 @@ crew.py prune --dry-run                                     # build output older
 crew.py run --role light --agent api:openrouter/<model> --task-file notes.md --wait
 crew.py set-key openrouter                                  # store a provider's API key
 crew.py models --provider openrouter                        # list a provider's models
+crew.py run --role implement --worktree --task-file todo.md --wait   # in its own git worktree
+crew.py doctor --ask                                        # prove every configured agent answers
+crew.py models --changes                                    # models added or removed since last time
 crew.py status | stats | quota | collect <run folder> | roles | models | doctor
 ```
 
@@ -268,6 +293,9 @@ Useful flags:
 | `--agent <spec>` | use a specific agent, e.g. `codex:gpt-6.1-sol@high` or `opencode:openrouter/<model>` |
 | `--caller codex\|claude\|agy\|opencode:<model>` | say who's calling, so crew skips that model family |
 | `--panel [N]` | send the task to N agents (default 2) from different model families, to compare |
+| `--worktree` | run in a new git worktree from HEAD, on branch `crew/<run>`; kept if the agent changed files, removed if not. Parallel write tasks then can't collide |
+| `--stall-minutes N` | stop an agent that prints nothing for N minutes (status `stalled`; not for agy, which prints only at the end) |
+| `--max-cost USD` | cost cap: Claude enforces it (`--max-budget-usd`); for other agents crew flags a run that went over |
 
 ## How strictly scopes are enforced
 
@@ -325,6 +353,8 @@ Other settings:
 | `view` | `auto`, `tab` or `hidden` terminal |
 | `hold` | keep tabs open after a task finishes |
 | `max_minutes` | kill runaway tasks (default 60) |
+| `stall_minutes` | stop an agent that prints nothing for this long (off by default; also per role) |
+| `max_cost_usd` | cost cap per run (see `--max-cost`; also per role) |
 | `fact_check` | check cited URLs and package versions after web tasks (default on) |
 | `prune_scratch` | remove build output from a run's scratch folder when it finishes (default on) |
 | `roles.<name>.env` | environment for that role's agents; `{cache}` is a build folder kept between runs, e.g. `"CARGO_TARGET_DIR": "{cache}/target"` |
@@ -333,7 +363,9 @@ Other settings:
 | `terminal` | use your own terminal, e.g. `["kitty", "@", "launch", "{argv}"]` |
 | `backends.<name>.exe` | point to a CLI that isn't on PATH |
 | `backends.<name>.command` | add a command-line agent crew doesn't know |
-| `providers.<name>` | a model API: `base_url`, `key_env`, and optionally `anthropic_url`, `responses`, `effort_style`, `family`, `headers`, `body` |
+| `providers.<name>` | a model API: `base_url`, `key_env`, and optionally `anthropic_url`, `auth_env`, `responses`, `allowed_models`, `effort_style`, `family`, `headers`, `body` |
+| `backends.codex.ignore_user_config` | skip your `~/.codex/config.toml` entirely; otherwise crew disables its MCP servers by name for each run |
+| `backends.opencode.private_db` | keep crew's OpenCode sessions in the run folder |
 
 Tabs open automatically in Windows Terminal, Terminal.app (untested) or tmux.
 
@@ -370,6 +402,9 @@ or when you want a per-task permission scope and a readable record of every prom
 | fact check says a site "could not be checked" | the site blocks automated requests; the link may be fine, so open it yourself |
 | old tabs pile up | finished tabs wait for Enter while `hold` is on; set `"hold": false`, or pass `--no-hold` |
 | `~/.crew/runs` is very large | runs from before 1.3 kept their build output; run `crew.py prune` |
+| status `stalled` | the agent printed nothing for `stall_minutes`; raise it, or turn it off for that role |
+| a codex run reports it "could not list your codex MCP servers" | your codex has no `mcp list --json`; update codex, or set `backends.codex.ignore_user_config` |
+| old `crew/...` branches pile up | they belong to kept worktrees; merge what you want, then `git worktree remove <path>` and `git branch -D <branch>` |
 | `no API key` for a provider | `crew.py set-key <provider>`, or export the variable `crew.py models` names. Tabs may not inherit your shell's variables, so `set-key` is the reliable way |
 | an `api` task fails with `cannot edit files` or `cannot search the web` | `api` agents have no tools; use `--access read --no-web`, or an opencode, codex or claude agent |
 | an opencode task stops at a denied tool | the scope denies it (see `denied_tools`); widen `--access` or `--web` if the task needs it |
@@ -402,6 +437,17 @@ macOS, and checks the skill against the
 - Usage limits are tracked per provider; OpenRouter credit limits are read from its key endpoint.
 - `crew.py set-key` stores API keys outside run folders; `crew.py models --provider` lists a
   provider's models; `--caller opencode:<model>`.
+- OpenCode 2: each run gets a private server (`--standalone`) so its permissions apply, and effort
+  is sent as `provider/model#effort`. The prompt goes on stdin, and every agent gets `PWD` set to
+  its working folder (OpenCode reads its project from it). Optional per-run OpenCode database.
+- Codex runs with plugins off and your MCP servers disabled by name, since Codex runs MCP tools
+  outside its sandbox. On Windows, npm `.cmd` launchers are run without cmd.exe.
+- `--worktree` runs a task in its own git worktree; `--stall-minutes` stops a silent agent;
+  `--max-cost` caps or flags spending; `crew.py status` shows how long a running agent has been quiet.
+- `crew.py doctor --ask` sends every configured agent a one-word question; `crew.py models --changes`
+  reports models added or removed since the last check.
+- Providers: `auth_env` for endpoints that want the key as `ANTHROPIC_API_KEY` (Kimi's coding plan),
+  and `allowed_models` to limit which models a provider may run.
 
 **1.3.0**
 - Build output is removed from a run's scratch folder when it finishes. Before this, every Rust

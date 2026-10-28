@@ -234,7 +234,36 @@ def backend_cmd(cfg: dict, backend: str):
         return list(exe)
     name = os.path.expanduser(exe) if exe else backend
     found = name if Path(name).is_file() else shutil.which(name)
+    if found and IS_WIN and found.lower().endswith((".cmd", ".bat")):
+        return windows_shim_target(found) or [found]
     return [found] if found else None
+
+
+def windows_shim_target(shim: str):
+    """What an npm/pnpm .cmd shim runs, as an argv prefix, or None if it isn't recognised. Running
+    the target directly keeps cmd.exe, which reinterprets &, |, % and newlines, out of the way.
+    The shim's last line that passes %* on names the target as a quoted "%dp0%" path."""
+    try:
+        content = Path(shim).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [line for line in content.splitlines() if "%*" in line]
+    if not lines:
+        return None
+    paths = [m for m in re.findall(r'"(%~?dp0%?[^"]*)"', lines[-1], re.I) if not m.lower().endswith("node.exe")]
+    if not paths:
+        return None
+    rel = re.sub(r"^%~?dp0%?\\?", "", paths[-1], flags=re.I).replace("\\", os.sep)
+    target = os.path.normpath(os.path.join(os.path.dirname(shim), rel))
+    if not Path(target).is_file():
+        return None
+    if target.lower().endswith((".exe", ".com")):
+        return [target]
+    if not re.search(r"node(\.exe)?\b", lines[-1], re.I) and "%_prog%" not in lines[-1].lower():
+        return None  # run by something other than node
+    local = Path(shim).with_name("node.exe")
+    node = str(local) if local.is_file() else shutil.which("node")
+    return [node, target] if node else None
 
 
 # ------------------------------------------------------------------ providers
@@ -294,6 +323,12 @@ def provider_unavailable(cfg: dict, spec: dict):
     pcfg = providers(cfg).get(name)
     if pcfg is None:
         return f"unknown provider '{name}'"
+    allowed = pcfg.get("allowed_models")
+    model = api_model(spec) if spec["backend"] == "api" else spec["model"]
+    if allowed and model not in allowed:
+        return f"model {model} is not in providers.{name}.allowed_models"
+    if spec["backend"] == "api" and not pcfg.get("base_url"):
+        return f"provider {name} has no OpenAI-compatible endpoint (base_url) for api agents"
     if spec["backend"] == "claude" and not pcfg.get("anthropic_url"):
         return f"provider {name} has no Anthropic-compatible endpoint (anthropic_url) for claude"
     if spec["backend"] == "codex" and not pcfg.get("responses"):
@@ -951,9 +986,43 @@ def codex_windows_sandbox():
     return m[1] if m else None
 
 
+SAFE_MCP_NAME = re.compile(r"^[^\s.=\"'\x00-\x1f](?:[^.=\"'\x00-\x1f]*[^\s.=\"'\x00-\x1f])?$")
+
+
+def codex_isolation(cfg: dict, cmd: list):
+    """(-c options, enforcement note) that keep the user's MCP servers and plugins out of a codex
+    run. Codex runs MCP tools outside its shell sandbox, so a read-only task could still write
+    through one. Plugins bring their own servers; each server still enabled is disabled by name."""
+    opts = ["-c", "features.plugins=false"]
+    if ((cfg.get("backends") or {}).get("codex") or {}).get("ignore_user_config"):
+        return opts, "none: your codex config (and its MCP servers) is skipped"
+    try:
+        r = subprocess.run(cmd + ["mcp", "list", "--json"] + opts, capture_output=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        listed = json.loads(r.stdout.decode("utf-8", "replace")) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        listed = None
+    if not isinstance(listed, list):
+        return opts, ("could not list your codex MCP servers (`codex mcp list --json`), so any you have stay "
+                      "enabled and run outside codex's sandbox; set backends.codex.ignore_user_config to skip them")
+    names = []
+    for entry in listed:
+        if not isinstance(entry, dict) or entry.get("enabled") is not True or not isinstance(entry.get("name"), str):
+            continue
+        if not SAFE_MCP_NAME.match(entry["name"]):
+            raise CrewError(f"codex MCP server {entry['name'][:80]!r} can't be disabled safely by name; "
+                            "rename or disable it, or set backends.codex.ignore_user_config")
+        names.append(entry["name"])
+    for name in names:
+        opts += ["-c", f"mcp_servers.{name}.enabled=false"]
+    return opts, (f"your {len(names)} codex MCP server(s) disabled for this run" if names
+                  else "none enabled in your codex config") + "; plugins off"
+
+
 def codex_args(cfg, spec, effort, scope, task: Path, cwd: Path, mode: str, target=None, session=None,
-               extra_write=()) -> list:
+               extra_write=(), isolation=()) -> list:
     opts = ["--json", "--skip-git-repo-check", "-m", spec["model"], "-o", str(task / "final.md")]
+    opts += list(isolation)
     if ((cfg.get("backends") or {}).get("codex") or {}).get("ignore_user_config"):
         opts.append("--ignore-user-config")
         ws = codex_windows_sandbox()
@@ -1057,11 +1126,17 @@ def claude_provider_env(cfg: dict, spec: dict):
            "ANTHROPIC_MODEL": model, "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
            "ANTHROPIC_DEFAULT_SONNET_MODEL": model, "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
            "CLAUDE_CODE_SUBAGENT_MODEL": model}
+    # Most Anthropic-compatible endpoints take the key as a bearer token (ANTHROPIC_AUTH_TOKEN); some
+    # want it as ANTHROPIC_API_KEY instead (providers.<name>.auth_env).
+    auth = pcfg.get("auth_env") or "ANTHROPIC_AUTH_TOKEN"
+    if auth != "ANTHROPIC_AUTH_TOKEN":
+        env.pop("ANTHROPIC_API_KEY", None)
+        env["ANTHROPIC_AUTH_TOKEN"] = None  # None removes it from the agent's environment
     secret = {}
     if pcfg.get("key_env"):
-        secret["ANTHROPIC_AUTH_TOKEN"] = pcfg["key_env"]
+        secret[auth] = pcfg["key_env"]
     else:
-        env["ANTHROPIC_AUTH_TOKEN"] = spec["provider"]  # local servers want some token and ignore it
+        env[auth] = spec["provider"]  # local servers want some token and ignore it
     return env, secret
 
 
@@ -1080,28 +1155,47 @@ def opencode_config(scope: dict) -> dict:
             "autoupdate": False}
 
 
-def opencode_args(cmd: list, spec, effort, task: Path, text: str, session=None):
-    """argv for `opencode run`, plus a note when the installed version can't take the effort."""
-    # cmd.exe mangles multi-line arguments to a .cmd/.bat shim (npm installs one), so there the
-    # task always goes as an attached file.
-    shim = IS_WIN and cmd[0].lower().endswith((".cmd", ".bat"))
-    help_text = cli_help(cmd + ["run"])
-    args = ["run", "--format", "json", "-m", spec["model"]]
-    note = None
-    if effort:
-        if "--variant" in help_text:
+_version_cache = {}
+
+
+def cli_version(cmd: list):
+    """(major, minor) from `<cmd> --version`, or None if it can't be read."""
+    key = tuple(cmd)
+    if key not in _version_cache:
+        try:
+            r = subprocess.run(cmd + ["--version"], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+            m = re.search(r"(\d+)\.(\d+)", (r.stdout + r.stderr).decode("utf-8", "replace"))
+            _version_cache[key] = (int(m[1]), int(m[2])) if m else None
+        except (OSError, subprocess.TimeoutExpired):
+            _version_cache[key] = None
+    return _version_cache[key]
+
+
+def opencode_args(cmd: list, spec, effort, session=None):
+    """argv tail for `opencode run`, plus a note when the effort can't be passed. The prompt goes
+    on stdin, which avoids quoting problems and Windows' cmd.exe.
+
+    OpenCode 2 runs sessions through a shared background server that owns configuration and
+    permissions, so a run's own environment (crew's permission config) is ignored there unless
+    the run gets a private server: --standalone. It also takes effort as a model variant
+    (provider/model#effort) instead of 1.x's --variant flag."""
+    version = cli_version(cmd)
+    v2 = bool(version and version[0] >= 2)
+    model, note = spec["model"], None
+    args = ["run"]
+    if v2:
+        args.append("--standalone")
+        if effort and "#" not in model:
+            model = f"{model}#{effort}"
+    args += ["--format", "json", "-m", model]
+    if effort and not v2:
+        if "--variant" in cli_help(cmd + ["run"]):
             args += ["--variant", effort]
         else:
             note = f"this opencode has no --variant flag, so effort={effort} was not passed"
     if session:
         args += ["-s", session]
-    prompt = text
-    if (len(text) > INLINE_PROMPT_LIMIT or shim) and "--file" in help_text:
-        args += ["--file", str(task / "task.md")]
-        prompt = "Your full instructions are in the attached file task.md. Read it completely and follow it exactly."
-    if prompt.startswith("-"):
-        prompt = " " + prompt  # never let the prompt read as a flag
-    return args + [prompt], note
+    return args, note
 
 
 def command_args(bcfg: dict, spec, effort, scope, task: Path, cwd: Path, text: str):
@@ -1367,6 +1461,10 @@ def print_result(task: Path) -> int:
         print("crew: SCOPE VIOLATION: files changed that this task's access level does not allow:")
         for p in r["violations"]:
             print(f"  {p}")
+    wt = r.get("worktree")
+    if wt and wt.get("kept"):
+        print(f"crew: worktree {wt['path']} (branch {wt['branch']}); merge or cherry-pick it, then "
+              f"`git worktree remove {wt['path']}`")
     if r.get("touched_files"):
         print("crew: touched files (relative to the repository root):")
         for p in r["touched_files"]:
@@ -1427,7 +1525,7 @@ def resolve_caller(arg):
 
 
 REQUEST_KEYS = ("role", "agent", "model", "effort", "cd", "access", "web", "network", "target", "slug",
-                "max_minutes", "caller", "view", "hold", "timeout")
+                "max_minutes", "caller", "view", "hold", "timeout", "worktree", "max_cost", "stall_minutes")
 
 
 def cmd_run(args) -> int:
@@ -1514,6 +1612,8 @@ def run_resume(cfg, args) -> int:
     exe = backend_cmd(cfg, spec["backend"])
     if not exe:
         raise CrewError(f"{spec['backend']} is not installed (or backends.{spec['backend']}.exe is wrong)")
+    if not Path(pc["cwd"]).is_dir():
+        raise CrewError(f"{pc['cwd']} no longer exists (a worktree is removed when its run changed nothing)")
     role = pc["role"]
     role_cfg = (cfg.get("roles") or {}).get(role) or {}
     # Results written before session_cost_usd existed stored the session total in cost_usd.
@@ -1588,6 +1688,16 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
     task = new_task_dir(role, args.slug or cwd.name)
     scratch = task / "scratch"
     scratch.mkdir()
+    worktree = None
+    if getattr(args, "worktree", False) and not session:
+        if not top:
+            shutil.rmtree(task, ignore_errors=True)
+            raise CrewError("--worktree needs a git repository (--cd inside one)")
+        if is_review:
+            shutil.rmtree(task, ignore_errors=True)
+            raise CrewError("--worktree doesn't apply to reviews: a new worktree holds only committed files")
+        worktree = make_worktree(top, task, cwd)
+        cwd, top = Path(worktree["cwd"]), worktree["path"]
     if builtin_review:
         sent = f"(built-in codex review of target: {args.target}; no prompt is sent)"
     elif session:
@@ -1608,26 +1718,42 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
     backend_env, secret_env, effort_note, api_cfg = {}, {}, None, None
     if backend == "codex":
         mode = "resume" if session else ("builtin-review" if builtin_review else "exec")
-        argv = exe + codex_args(cfg, spec, effort, scope, task, cwd, mode, args.target, session, extra_write)
+        isolation, enf["mcp"] = codex_isolation(cfg, exe)
+        argv = exe + codex_args(cfg, spec, effort, scope, task, cwd, mode, args.target, session, extra_write,
+                                isolation)
         use_stdin = not builtin_review
         if provider and pcfg.get("key_env"):
             secret_env[pcfg["key_env"]] = pcfg["key_env"]  # from ~/.crew/keys.json when not in the environment
     elif backend == "claude":
         argv = exe + claude_args(exe, spec, effort, scope, task, top, cwd, role_cfg, session, extra_write)
         use_stdin = True
+        enf["mcp"] = "none (--strict-mcp-config with no servers)"
         if provider:
             backend_env, secret_env = claude_provider_env(cfg, spec)
     elif backend == "agy":
         argv = exe + agy_args(spec, effort, scope, task, cwd, sent)
         use_stdin = False
     elif backend == "opencode":
-        tail, effort_note = opencode_args(exe, spec, effort, task, sent, session)
-        argv, use_stdin = exe + tail, False
+        tail, effort_note = opencode_args(exe, spec, effort, session)
+        argv, use_stdin = exe + tail, True
         oc_cfg = opencode_config(scope)
         write_json(task / "opencode-config.json", oc_cfg)
-        # Inline config outranks the user's global and project opencode configs.
+        enf["mcp"] = "denied: crew's permission rules start from '*': deny"
+        if (cli_version(exe) or (0,))[0] >= 2:
+            enf["files"] += " (on a private --standalone server, so these rules apply)"
+        # Inline config outranks the user's global and project opencode configs. 1.x also reads
+        # OPENCODE_PERMISSION; 2.x reads only the inline config (and only on a private server).
         backend_env = {"OPENCODE_CONFIG_CONTENT": json.dumps(oc_cfg),
                        "OPENCODE_PERMISSION": json.dumps(oc_cfg["permission"])}
+        if bcfg.get("private_db"):  # keep crew's sessions out of the user's own opencode history
+            prior = None
+            if session and getattr(args, "resume", None):
+                try:
+                    prior = read_json(Path(args.resume).expanduser() / "cmd.json").get("opencode_db")
+                except (OSError, ValueError):
+                    prior = None
+            opencode_db = prior or str(task / "opencode.db")
+            backend_env["OPENCODE_DB"] = opencode_db
     elif backend == "api":
         argv, use_stdin = exe + ["--dir", str(task)], False
         api_cfg = {"provider": provider, "base_url": pcfg["base_url"], "key_env": pcfg.get("key_env"),
@@ -1655,6 +1781,16 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
             rel = Path(os.path.relpath(cwd / p, top)).as_posix()
             allowed.append(rel.rstrip("/") + "/" if p.endswith("/") else rel)
     max_minutes = args.max_minutes or role_cfg.get("max_minutes") or cfg.get("max_minutes") or 60
+    stall_minutes = getattr(args, "stall_minutes", None) or role_cfg.get("stall_minutes") or cfg.get("stall_minutes")
+    if stall_minutes and backend == "agy":
+        stall_minutes = None  # agy prints nothing until it has finished, so silence isn't a stall
+    max_cost = getattr(args, "max_cost", None) or role_cfg.get("max_cost_usd") or cfg.get("max_cost_usd")
+    if max_cost:
+        if backend == "claude" and "--max-budget-usd" in cli_help(exe):
+            argv += ["--max-budget-usd", str(max_cost)]
+            enf["cost"] = f"claude --max-budget-usd {max_cost} (checked between turns, so one turn can overshoot)"
+        else:
+            enf["cost"] = f"not enforced by {backend}: crew reports a run that cost more than ${max_cost} afterwards"
     agent_label = spec_str(dict(spec, effort=effort))
     view = args.view or cfg.get("view", "auto")
     hold = cfg.get("hold", True) if args.hold is None else args.hold
@@ -1666,7 +1802,9 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
            "prior_session_cost_usd": None, "fact_check": bool(scope["web"] and cfg.get("fact_check", True)),
            "prune_scratch": bool(cfg.get("prune_scratch", True)), "cache": str(cache) if cache else None,
            "view": view, "hold": hold, "created": now_iso(), "provider": provider, "quota_key": quota_key(spec),
-           "secret_env": secret_env, "api": api_cfg, "effort_note": effort_note}
+           "secret_env": secret_env, "api": api_cfg, "effort_note": effort_note,
+           "opencode_db": backend_env.get("OPENCODE_DB"), "worktree": worktree,
+           "stall_minutes": stall_minutes, "max_cost_usd": max_cost}
     cmd.update(extra or {})
     write_json(task / "cmd.json", cmd)
 
@@ -1682,7 +1820,7 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
         elif not how and view == "tab":
             print("crew: no usable terminal launcher; running hidden instead (see README: Visible terminals)")
     if not how:
-        launch_hidden(runner, cwd)
+        launch_hidden(runner, task)
         how = "hidden background process"
     print(f"crew: launched {role} -> {agent_label} in {how}")
     if caller:
@@ -1692,8 +1830,34 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
     print(f"crew: scope access={scope['access']} web={on_off(scope['web'])} network={on_off(scope['network'])}")
     for dim, how_enforced in enf.items():
         print(f"crew:   {dim}: {how_enforced}")
+    if worktree:
+        print(f"crew: worktree {worktree['path']} on branch {worktree['branch']} (from HEAD: uncommitted "
+              "changes in your checkout are not in it)")
     print(f"crew: dir={task}")
     return task
+
+
+def make_worktree(top: str, task: Path, cwd: Path) -> dict:
+    """A git worktree for one run, at <run folder>/worktree on branch crew/<run name>. It starts
+    from HEAD, so parallel write tasks can't trip over each other or over your own edits."""
+    path, branch = task / "worktree", f"crew/{task.name}"
+    r = subprocess.run(["git", "-C", top, "worktree", "add", "-q", "-b", branch, str(path), "HEAD"],
+                       capture_output=True, timeout=300)
+    if r.returncode != 0:
+        shutil.rmtree(task, ignore_errors=True)
+        raise CrewError("could not create a worktree: " + r.stderr.decode("utf-8", "replace").strip())
+    rel = os.path.relpath(str(cwd), top)
+    return {"path": str(path), "branch": branch, "repo": top,
+            "cwd": str(path if rel == "." else path / rel)}
+
+
+def finish_worktree(wt: dict, touched: list) -> dict:
+    """Keep a run's worktree when the agent changed something; otherwise remove it and its branch."""
+    if touched:
+        return dict(wt, kept=True)
+    for args in (["worktree", "remove", "--force", wt["path"]], ["branch", "-D", wt["branch"]]):
+        subprocess.run(["git", "-C", wt["repo"], *args], capture_output=True, timeout=120)
+    return dict(wt, kept=False)
 
 
 def cmd_collect(args) -> int:
@@ -1794,6 +1958,13 @@ def cmd_status(args) -> int:
             print(f"{d.name:<48} {str(r.get('status')):<16} {str(r.get('agent')):<32} {r.get('seconds')}s")
         else:
             state = {"alive": "running", "dead": "dead (runner gone, no result)"}.get(runner_state(d), "starting?")
+            if state == "running":
+                try:
+                    quiet = time.time() - float(read_json(d / "run.json").get("last_output"))
+                    if quiet >= 60:
+                        state += f", no output for {quiet / 60:.0f} min"
+                except (OSError, ValueError, TypeError):
+                    pass
             print(f"{d.name:<48} {state}")
     return 0
 
@@ -1872,6 +2043,8 @@ def cmd_roles(args) -> int:
 
 def cmd_models(args) -> int:
     cfg = load_config()
+    if getattr(args, "changes", False):
+        return model_changes(cfg)
     if args.provider:
         for model in provider_models(cfg, args.provider):
             print(f"api:{args.provider}/{model}")
@@ -2094,6 +2267,8 @@ def cmd_doctor(args) -> int:
                ("this process runs in Windows session 0 (service/remote), so no window can open; tasks run hidden"
                 if IS_WIN and windows_service_session() else
                 "none found; tasks run hidden (set \"terminal\" in config, see README)"))
+    if getattr(args, "ask", False):
+        problems += ask_agents(cfg)
     print(f"\nconfig: {USER_CONFIG}{'' if USER_CONFIG.exists() else ' (not created; built-in defaults in use)'}")
     return 1 if problems else 0
 
@@ -2103,6 +2278,100 @@ def _safe_expand(cfg: dict, ref) -> list:
         return expand_agent(cfg, ref)
     except CrewError:
         return []
+
+
+def ask_agents(cfg: dict) -> int:
+    """Send every distinct, usable agent in the roles and aliases a one-word question, in parallel,
+    through crew's normal run path. Returns the number that failed."""
+    refs = [r.get("agent") for r in (cfg.get("roles") or {}).values()] + list((cfg.get("agents") or {}).values())
+    specs = {}
+    for ref in refs:
+        for spec in _safe_expand(cfg, ref):
+            if backend_cmd(cfg, spec["backend"]) and not provider_unavailable(cfg, spec):
+                specs.setdefault(spec_str(spec), spec)
+    roles = cfg.get("roles") or {}
+    role = "light" if "light" in roles else next(iter(roles), None)
+    if not specs or not role:
+        print("crew: no usable agents to ask")
+        return 0
+    probe_dir = CREW_HOME / "doctor"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nAsking {len(specs)} agent(s) a one-word question (this uses a little of each one's quota)...")
+
+    def ask(label):
+        argv = [sys.executable, str(Path(__file__).resolve()), "run", "--role", role, "--agent", label,
+                "--caller", "none", "--access", "read", "--no-web", "--no-network", "--view", "hidden",
+                "--no-hold", "--max-minutes", "5", "--timeout", "420", "--slug", "doctor-ask",
+                "--cd", str(probe_dir), "--wait", "--task", "Reply with the single word OK and nothing else."]
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=480)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return label, False, str(e)
+        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        status = re.search(r"^crew: (\S+) \|", out, re.M)
+        answer = out.split("----- final answer -----", 1)[-1].strip() if "----- final answer -----" in out else ""
+        if r.returncode == 0:
+            return label, True, f"answered {short(answer, 40)!r}"
+        why = status[1] if status else short(out.strip().splitlines()[-1] if out.strip() else "no output", 160)
+        return label, False, why
+
+    failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for label, ok, detail in pool.map(ask, sorted(specs)):
+            failed += not ok
+            print(f"[{'ok  ' if ok else 'FAIL'}] ask {label}: {detail}")
+    return failed
+
+
+MODELS_SEEN = CREW_HOME / "models-seen.json"
+
+
+def current_model_lists(cfg: dict) -> dict:
+    """Model ids per source, from local catalogues and the providers you have keys for."""
+    lists = {}
+    cm = codex_models()
+    if cm is not None:
+        lists["codex"] = sorted(str(m.get("slug")) for m in cm if m.get("slug"))
+    am = agy_models(cfg)
+    if am is not None:
+        lists["agy"] = sorted(m["slug"] for m in am)
+    om = opencode_models(cfg)
+    if om:
+        lists["opencode"] = sorted(om)
+    for name, pcfg in providers(cfg).items():
+        if not pcfg.get("base_url") or (pcfg.get("key_env") and not read_secret(pcfg["key_env"])):
+            continue
+        try:
+            lists[f"provider:{name}"] = provider_models(cfg, name)
+        except CrewError:
+            continue  # a local server that isn't running, or a provider without a model list
+    return lists
+
+
+def model_changes(cfg: dict) -> int:
+    try:
+        seen = read_json(MODELS_SEEN)
+    except (OSError, ValueError):
+        seen = {}
+    lists = current_model_lists(cfg)
+    if not seen:
+        print(f"crew: recorded {sum(map(len, lists.values()))} models from {', '.join(lists) or 'no sources'}; "
+              "later runs of `crew.py models --changes` report what was added or removed")
+    changed = False
+    for source, models in lists.items():
+        if source not in seen:
+            if seen:
+                changed = True
+                print(f"{source}: new source, {len(models)} models")
+            continue
+        for sign, diff in (("+", set(models) - set(seen[source])), ("-", set(seen[source]) - set(models))):
+            for m in sorted(diff):
+                changed = True
+                print(f"{source}: {sign} {m}")
+    if seen and not changed:
+        print("crew: no model changes since the last check")
+    write_json(MODELS_SEEN, dict(seen, **lists))
+    return 0
 
 
 def cmd_setup_agy_web(args) -> int:
@@ -2177,6 +2446,8 @@ def provider_models(cfg: dict, name: str) -> list:
     pcfg = providers(cfg).get(name)
     if pcfg is None:
         raise CrewError(f"Unknown provider '{name}' (known: {', '.join(providers(cfg))})")
+    if not pcfg.get("base_url"):
+        raise CrewError(f"provider {name} has no base_url to list models from")
     headers = {"User-Agent": "crew"}
     headers.update(pcfg.get("headers") or {})
     if pcfg.get("key_env"):
@@ -2195,7 +2466,7 @@ def provider_models(cfg: dict, name: str) -> list:
 
 
 def provider_status(cfg: dict, name: str, pcfg: dict) -> str:
-    uses = ["api"] + (["claude+"] if pcfg.get("anthropic_url") else []) + (["codex+"] if pcfg.get("responses") else [])
+    uses = (["api"] if pcfg.get("base_url") else []) + (["claude+"] if pcfg.get("anthropic_url") else []) + (["codex+"] if pcfg.get("responses") else [])
     if pcfg.get("key_env"):
         key = "key set" if read_secret(pcfg["key_env"]) else f"no key ({pcfg['key_env']})"
     else:
@@ -2669,6 +2940,9 @@ def enable_vt() -> None:
         pass
 
 
+LAST_OUTPUT = [time.time()]  # when the agent last printed anything; the heartbeat reports it
+
+
 class View:
     """Shows agent output live and keeps a compact copy in raw.log. Plain-text agents (agy)."""
 
@@ -2687,6 +2961,7 @@ class View:
         self.quota = None  # usage-limit windows the backend reported, if it reports them
 
     def show(self, text: str, style=None) -> None:
+        LAST_OUTPUT[0] = time.time()
         out = f"\x1b[{COLOURS[style]}m{text}\x1b[0m" if style and self.colour else text
         print(out, flush=True)
         if self.raw.closed:  # crew's own notes after the agent has finished still belong in the log
@@ -2718,6 +2993,7 @@ class JsonView(View):
         self.last_message = None
 
     def feed(self, line: str) -> None:
+        LAST_OUTPUT[0] = time.time()  # an event the view doesn't display still shows the agent is working
         self.events.write(line if line.endswith("\n") else line + "\n")
         self.events.flush()
         s = line.strip()
@@ -2991,6 +3267,7 @@ def heartbeat(task: Path, stop: threading.Event) -> None:
     info = {"pid": os.getpid(), "started": now_iso()}
     while True:
         info["beat"] = time.time()
+        info["last_output"] = LAST_OUTPUT[0]
         try:
             write_json(task / "run.json", info)
         except OSError:
@@ -3001,7 +3278,7 @@ def heartbeat(task: Path, stop: threading.Event) -> None:
 
 def print_header(cmd: dict, text: str, task: Path, view: View) -> None:
     argv = list(cmd["argv"])
-    if cmd["backend"] in ("agy", "opencode") and argv:
+    if cmd["backend"] == "agy" and argv:
         argv[-1] = short(argv[-1], 60)  # the prompt; shown in full below
     scope = cmd["scope"]
     view.show("=" * 72, "dim")
@@ -3254,7 +3531,11 @@ def retry_elsewhere(task: Path):
 
 def agent_env(cmd: dict) -> dict:
     env = {k: v for k, v in os.environ.items() if not SESSION_VAR_RE.match(k.upper())}
-    env.update(cmd.get("env") or {})
+    for key, value in (cmd.get("env") or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     for var, source in (cmd.get("secret_env") or {}).items():  # API keys, never stored in cmd.json
         value = read_secret(source)
         if value:
@@ -3270,7 +3551,9 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
     top = cmd.get("git_top")
     before = git_state(top) if top else None
     popen_kw = {} if IS_WIN else {"start_new_session": True}
-    proc = subprocess.Popen(cmd["argv"], cwd=cmd["cwd"], env=agent_env(cmd),
+    env = agent_env(cmd)
+    env["PWD"] = cmd["cwd"]  # some CLIs (opencode) take their project folder from PWD, not the process cwd
+    proc = subprocess.Popen(cmd["argv"], cwd=cmd["cwd"], env=env,
                             stdin=subprocess.PIPE if cmd["stdin"] else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **popen_kw)
     if cmd["stdin"]:
@@ -3281,7 +3564,7 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
             except (BrokenPipeError, OSError):
                 pass
         threading.Thread(target=feed, daemon=True).start()
-    timed_out = threading.Event()
+    timed_out, stalled = threading.Event(), threading.Event()
 
     def on_timeout():
         timed_out.set()
@@ -3289,6 +3572,17 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
     timer = threading.Timer(float(cmd.get("max_minutes") or 60) * 60, on_timeout)
     timer.daemon = True
     timer.start()
+    LAST_OUTPUT[0] = time.time()
+    if cmd.get("stall_minutes"):
+        def watch_stall():
+            limit = float(cmd["stall_minutes"]) * 60
+            while proc.poll() is None:
+                if time.time() - LAST_OUTPUT[0] > limit:
+                    stalled.set()
+                    kill_tree(proc)
+                    return
+                time.sleep(min(5.0, limit / 4))
+        threading.Thread(target=watch_stall, daemon=True).start()
     try:
         for raw in proc.stdout:
             view.feed(raw.decode("utf-8", "replace"))
@@ -3311,7 +3605,9 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
         violations = [p for p in touched if not any(p.startswith(a) for a in allowed)]
 
     note = None
-    if timed_out.is_set():
+    if stalled.is_set():
+        status, note = "stalled", f"killed after no output for stall_minutes={cmd.get('stall_minutes')}"
+    elif timed_out.is_set():
         status, note = "timeout", f"killed after max_minutes={cmd.get('max_minutes')}"
     elif rc != 0 or view.error:
         status = "agent-error"
@@ -3342,12 +3638,22 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
     if isinstance(session_cost, (int, float)) and isinstance(cmd.get("prior_session_cost_usd"), (int, float)):
         cost = max(session_cost - cmd["prior_session_cost_usd"], 0.0)
     resolved = view.resolved_model or cmd["model"]
+    cap = _num(cmd.get("max_cost_usd"))
+    if cap is not None and isinstance(cost, (int, float)) and cost > cap:
+        over = f"cost ${cost:.4f} is over max_cost_usd ${cap}"
+        note = f"{note}; {over}" if note else over
+    worktree = finish_worktree(cmd["worktree"], touched) if cmd.get("worktree") else None
+    if worktree:
+        wt_note = (f"changes are in worktree {worktree['path']} on branch {worktree['branch']}" if worktree["kept"]
+                   else "the worktree had no changes and was removed")
+        note = f"{note}; {wt_note}" if note else wt_note
     result = {"status": status, "note": note, "exit": rc, "role": cmd["role"], "agent": cmd["agent"],
               "backend": cmd["backend"], "model": cmd["model"], "resolved_model": resolved,
               "scope": cmd["scope"], "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
               "session_cost_usd": session_cost, "cost_note": view.cost_note, "model_usage": view.model_usage,
               "session_id": view.session, "touched_files": touched, "violations": violations,
               "denied_tools": view.denied, "quota": quota, "checks": checks, "retried_as": retried_as,
+              "worktree": worktree,
               "final": str(final), "finished": now_iso()}
     write_json(task / "result.json", result)
     append_line(LEDGER, json.dumps({
@@ -3400,6 +3706,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--hold", action=argparse.BooleanOptionalAction, default=None,
                    help="keep the terminal tab open after the task ends")
     r.add_argument("--max-minutes", type=float, help="kill the agent after this long")
+    r.add_argument("--stall-minutes", type=float,
+                   help="kill the agent if it prints nothing for this long (not for agy, which prints only at the end)")
+    r.add_argument("--max-cost", type=float, metavar="USD",
+                   help="cost cap: enforced by claude (--max-budget-usd); other agents are flagged afterwards")
+    r.add_argument("--worktree", action="store_true",
+                   help="run in a new git worktree from HEAD (kept with its branch if the agent changed files)")
     r.add_argument("--wait", action="store_true", help="block until done, then print the final answer")
     r.add_argument("--timeout", type=float, default=3600, help="seconds --wait waits (default 3600)")
     r.add_argument("--panel", type=int, nargs="?", const=2, default=None, metavar="N",
@@ -3432,6 +3744,8 @@ def build_parser() -> argparse.ArgumentParser:
     ro.set_defaults(func=cmd_roles)
     mo = sub.add_parser("models", help="list the models each installed backend and provider offers")
     mo.add_argument("--provider", help="list the models a provider's API offers (needs its key)")
+    mo.add_argument("--changes", action="store_true",
+                    help="show models added or removed since the last --changes run, then remember the current lists")
     mo.set_defaults(func=cmd_models)
 
     sr = sub.add_parser("set-role", help="choose the agent and default scope for a role (saved in your config)")
@@ -3451,7 +3765,10 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("--remove", action="store_true")
     sa.set_defaults(func=cmd_set_agent)
 
-    sub.add_parser("doctor", help="check installation, logins, models and permissions").set_defaults(func=cmd_doctor)
+    dr = sub.add_parser("doctor", help="check installation, logins, models and permissions")
+    dr.add_argument("--ask", action="store_true",
+                    help="also send every configured agent a one-word question, to prove it is signed in and answering")
+    dr.set_defaults(func=cmd_doctor)
     sub.add_parser("setup-agy-web", help=f"add {AGY_FETCH_RULE} to agy's settings (backs the file up first)"
                    ).set_defaults(func=cmd_setup_agy_web)
 
