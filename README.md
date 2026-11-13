@@ -521,6 +521,9 @@ macOS, and checks the skill against the
 - `--brief` prints only the start of each answer and the path to the rest.
 - Timeouts stop the agent as soon as it exits instead of always waiting 5 seconds.
 
+**1.3.1** (Dellmine only, merged into 1.6.0)
+- `google-strong` became Gemini 4 Argon and `google-balanced` (`agy:gemini-4-argon-medium`) was added.
+
 **1.3.0**
 - Build output is removed from a run's scratch folder when it finishes. Before this, every Rust
   review kept a full build (2-8 GB each). Small evidence logs and the run record are kept.

@@ -107,6 +107,7 @@
     "claude-frontier": "claude:claude-fable-5-1@high",
     "google-fast": "agy:gemini-4-hydrogen-medium",
     "google-cheap": "agy:gemini-3.8-flash-medium",
+    "google-balanced": "agy:gemini-4-argon-medium",
     "google-strong": "agy:gemini-4-argon-high",
     "google-frontier": "api:gemini/gemini-4-carbon@high"
   },
