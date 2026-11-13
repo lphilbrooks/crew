@@ -1,5 +1,5 @@
 {
-  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed. A role with \"other_family\": true refuses to run on the caller's own model family unless --agent names the agent. Claude agents use full model ids, because Claude Code's short aliases can lag a release (claude 2.1.286 still maps 'haiku' to Haiku 4.5).",
+  "_doc": "Built-in defaults. Don't edit this file: put overrides in ~/.crew/config.json (or $CREW_CONFIG), by hand or with `crew.py set-role` / `crew.py set-agent`. Your file is merged over this one key by key. An agent is backend[+provider]:model[@effort]: codex, claude, agy, opencode (opencode:<provider>/<model>), api (api:<provider>/<model>), or a command-line agent you define under backends.<name>.command. Role agents are fallback lists: the first installed candidate is used, skipping the calling agent's own vendor when another candidate is installed. A role with \"other_family\": true refuses to run on the caller's own model family unless --agent names the agent. Claude agents use full model ids, because Claude Code's short aliases can lag a release (claude 2.1.286 still maps 'haiku' to Haiku 4.5).",
 
   "view": "auto",
   "hold": true,
@@ -22,6 +22,9 @@
     "agy": {
       "exe": null,
       "settings": "~/.gemini/antigravity-cli/settings.json"
+    },
+    "opencode": {
+      "exe": null
     }
   },
 
@@ -48,12 +51,18 @@
     "fable": {"backend": "claude", "model": "claude-fable-5-1", "efforts": ["low", "medium", "high", "xhigh", "max"],
               "default_effort": "high", "names": ["claude-fable-5-1", "claude fable", "fable 5.1"],
               "about": "Anthropic frontier model: the hardest problems"},
+    "hydrogen": {"backend": "agy", "model": "gemini-4-hydrogen-{effort}", "efforts": ["low", "medium", "high", "xhigh"],
+                 "default_effort": "medium", "names": ["gemini hydrogen", "gemini 4 hydrogen", "hydrogen 4", "gemini"],
+                 "about": "Google Gemini 4 Hydrogen (succeeds 3.8 Flash, Nov 2026): fast, Google Search built in; research, light builds, second opinions"},
     "gemini-flash": {"backend": "agy", "model": "gemini-3.8-flash-{effort}", "efforts": ["low", "medium", "high"],
-                     "default_effort": "medium", "names": ["gemini 3.8 flash", "flash", "gemini"],
-                     "about": "Google Gemini 3.8 Flash with Google Search built in: cheap research"},
+                     "default_effort": "medium", "names": ["gemini 3.8 flash", "flash"],
+                     "about": "Google Gemini 3.8 Flash: cheapest Gemini; fallback when Hydrogen is rate-limited"},
     "argon": {"backend": "agy", "model": "gemini-4-argon-{effort}", "efforts": ["low", "medium", "high"],
               "default_effort": "medium", "names": ["gemini argon", "gemini 4 argon", "argon 4", "gemini pro", "pro"],
-              "about": "Google Gemini 4 Argon, which replaced Gemini Pro: hard reasoning and builds; own weekly quota"},
+              "about": "Google Gemini 4 Argon, which replaced Gemini Pro: hard reasoning and reviews; own weekly quota"},
+    "carbon": {"backend": "api", "model": "gemini/gemini-4-carbon", "efforts": ["low", "medium", "high"],
+               "default_effort": "high", "names": ["gemini carbon", "gemini 4 carbon", "carbon 4"],
+               "about": "Google Gemini 4 Carbon, Google's strongest: hardest reasoning. Gemini API only (paid key, read-only, no tools) until agy offers it"},
     "agy-opus": {"backend": "agy", "model": "claude-opus-5-5-{effort}", "efforts": ["low", "medium", "high"],
                  "default_effort": "high", "names": ["opus via agy", "antigravity opus"],
                  "about": "Claude Opus 5.5 through agy: saves your Claude plan, same model family"},
@@ -67,6 +76,26 @@
 
   "role_names": {"build": "implement", "build-light": "implement-light"},
 
+  "_providers_doc": "Model APIs. api agents call them directly (api:<provider>/<model>, read-only, no tools). claude+<provider>:<model> needs anthropic_url (auth_env names the variable that carries the key, default ANTHROPIC_AUTH_TOKEN), codex+<provider>:<model> needs responses. allowed_models limits which models may be used. Keys come from the key_env variable or `crew.py set-key <provider>`. family is used when the model name doesn't say. Add your own (vLLM, LiteLLM, a company gateway) the same way.",
+  "providers": {
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY", "anthropic_url": "https://openrouter.ai/api", "responses": true, "effort_style": "openrouter", "body": {"usage": {"include": true}}, "headers": {"X-Title": "crew"}, "quota": "openrouter"},
+    "openai": {"base_url": "https://api.openai.com/v1", "key_env": "OPENAI_API_KEY", "responses": true, "effort_style": "openai", "family": "openai"},
+    "anthropic": {"base_url": "https://api.anthropic.com/v1", "key_env": "ANTHROPIC_API_KEY", "family": "anthropic"},
+    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "key_env": "GEMINI_API_KEY", "effort_style": "openai", "family": "google"},
+    "deepseek": {"base_url": "https://api.deepseek.com/v1", "key_env": "DEEPSEEK_API_KEY", "anthropic_url": "https://api.deepseek.com/anthropic", "family": "deepseek"},
+    "moonshot": {"base_url": "https://api.moonshot.ai/v1", "key_env": "MOONSHOT_API_KEY", "anthropic_url": "https://api.moonshot.ai/anthropic", "family": "moonshot"},
+    "kimi": {"base_url": null, "key_env": "KIMI_API_KEY", "anthropic_url": "https://api.kimi.com/coding/", "auth_env": "ANTHROPIC_API_KEY", "family": "moonshot"},
+    "zai": {"base_url": "https://api.z.ai/api/paas/v4", "key_env": "ZAI_API_KEY", "anthropic_url": "https://api.z.ai/api/anthropic", "family": "zhipu"},
+    "xai": {"base_url": "https://api.x.ai/v1", "key_env": "XAI_API_KEY", "family": "xai"},
+    "mistral": {"base_url": "https://api.mistral.ai/v1", "key_env": "MISTRAL_API_KEY", "family": "mistral"},
+    "groq": {"base_url": "https://api.groq.com/openai/v1", "key_env": "GROQ_API_KEY"},
+    "cerebras": {"base_url": "https://api.cerebras.ai/v1", "key_env": "CEREBRAS_API_KEY"},
+    "together": {"base_url": "https://api.together.xyz/v1", "key_env": "TOGETHER_API_KEY"},
+    "fireworks": {"base_url": "https://api.fireworks.ai/inference/v1", "key_env": "FIREWORKS_API_KEY"},
+    "ollama": {"base_url": "http://localhost:11434/v1", "key_env": null, "anthropic_url": "http://localhost:11434", "responses": true},
+    "lmstudio": {"base_url": "http://localhost:1234/v1", "key_env": null}
+  },
+
   "agents": {
     "codex-strong": "codex:gpt-6.1-sol@high",
     "codex-balanced": "codex:gpt-6.1-sol@medium",
@@ -76,13 +105,15 @@
     "claude-balanced": "claude:claude-sonnet-5-5@high",
     "claude-fast": "claude:claude-haiku-5-5@medium",
     "claude-frontier": "claude:claude-fable-5-1@high",
-    "google-fast": "agy:gemini-3.8-flash-medium",
-    "google-strong": "agy:gemini-4-argon-high"
+    "google-fast": "agy:gemini-4-hydrogen-medium",
+    "google-cheap": "agy:gemini-3.8-flash-medium",
+    "google-strong": "agy:gemini-4-argon-high",
+    "google-frontier": "api:gemini/gemini-4-carbon@high"
   },
 
   "roles": {
     "review": {
-      "agent": ["codex-strong", "claude-strong"],
+      "agent": ["codex-strong", "claude-strong", "google-strong"],
       "other_family": true,
       "mode": "review",
       "access": "verify",
@@ -91,7 +122,7 @@
       "about": "Code review of a diff (--target uncommitted | commit:<sha> | base:<branch>). Can build and run tests; repository changes are flagged."
     },
     "check": {
-      "agent": ["codex-strong", "claude-strong"],
+      "agent": ["codex-strong", "claude-strong", "google-strong"],
       "other_family": true,
       "access": "verify",
       "web": false,
@@ -99,14 +130,14 @@
       "about": "Second opinion on a plan, claim, design or specific code. Can build and run tests to back its findings."
     },
     "implement": {
-      "agent": ["codex-balanced", "claude-balanced"],
+      "agent": ["codex-balanced", "claude-balanced", "google-fast"],
       "access": "write",
       "web": false,
       "network": false,
       "about": "Bounded implementation. Edits the working tree, never commits; the caller checks the result and commits."
     },
     "implement-light": {
-      "agent": ["claude-fast", "codex-fast"],
+      "agent": ["claude-fast", "codex-fast", "google-fast"],
       "access": "write",
       "web": false,
       "network": false,
@@ -114,7 +145,7 @@
       "about": "Cheap mechanical work: boilerplate, fixtures, test scaffolding, docs from code."
     },
     "research": {
-      "agent": ["google-fast", "claude-fast", "codex-fast"],
+      "agent": ["google-fast", "google-cheap", "claude-fast", "codex-fast"],
       "access": "read",
       "web": true,
       "network": false,

@@ -73,10 +73,10 @@ class Sandbox(unittest.TestCase):
                 time.sleep(0.5)
         self.tmp.cleanup()
 
-    def crew(self, *args, mode="ok", **extra_env):
+    def crew(self, *args, mode="ok", input_text=None, **extra_env):
         env = dict(self.env, FAKE_MODE=mode, **extra_env)
         r = subprocess.run([sys.executable, str(CREW), *args], capture_output=True, text=True,
-                           encoding="utf-8", env=env, timeout=180)
+                           encoding="utf-8", env=env, timeout=180, input=input_text)
         return r.returncode, r.stdout + r.stderr
 
     def task_dir(self, out):
@@ -96,8 +96,9 @@ class TestSpecs(unittest.TestCase):
                          {"backend": "codex", "model": "gpt-6.1-sol", "effort": "high"})
         self.assertEqual(crew.parse_spec("agy:gemini-3.8-flash-medium")["effort"], None)
         self.assertEqual(crew.parse_spec("claude:opus@max")["backend"], "claude")
-        self.assertIsNone(crew.parse_spec("gemini:flash"))
         self.assertIsNone(crew.parse_spec("nonsense"))
+        with self.assertRaises(crew.CrewError):  # well formed, but no such backend
+            crew.expand_agent({}, "gemini:flash")
 
     def test_aliases_and_fallback(self):
         cfg = {"agents": {"a": ["agy:m1", "b"], "b": "codex:m2@low"}}
@@ -275,9 +276,17 @@ class TestEndToEnd(Sandbox):
         self.assertEqual(self.result(out)["status"], "permission-denied")
 
     def test_agy_verify_refused(self):
-        rc, out = self.crew("run", "--role", "check", "--agent", "agy:m", "--cd", str(self.repo), "--task", "x")
+        rc, out = self.crew("run", "--role", "check", "--agent", "agy:m", "--access", "verify",
+                            "--cd", str(self.repo), "--task", "x")
         self.assertEqual(rc, 1)
         self.assertIn("cannot build or test", out)
+
+    def test_agy_role_verify_runs_read_only(self):
+        # check/review fall back to Gemini Argon via agy; the role's verify becomes read-only.
+        rc, out = self.crew("run", "--role", "check", "--agent", "agy:m", "--cd", str(self.repo), "--task", "x", "--wait")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("runs read-only (no builds or tests)", out)
+        self.assertEqual(self.result(out)["scope"]["access"], "read")
 
     def test_long_agy_task_passed_by_file(self):
         rc, out = self.crew("run", "--role", "light", "--agent", "google-fast", "--cd", str(self.repo),
@@ -376,15 +385,16 @@ class TestPreambleAndDefaults(unittest.TestCase):
         self.assertEqual(cfg["agents"]["claude-fast"], "claude:claude-haiku-5-5@medium")
         for role in ("implement-light", "light"):
             self.assertEqual(cfg["roles"][role]["agent"][0], "claude-fast", role)
-        # Research goes to Gemini Flash first, for its built-in Google Search.
-        self.assertEqual(cfg["roles"]["research"]["agent"][:2], ["google-fast", "claude-fast"])
+        # Research goes to Gemini 4 Hydrogen first, for speed and its built-in Google Search; 3.8 Flash
+        # is the cheaper Google fallback when Hydrogen is limited.
+        self.assertEqual(cfg["roles"]["research"]["agent"][:3], ["google-fast", "google-cheap", "claude-fast"])
         installed = lambda c, b: [b]  # noqa: E731
         saved, crew.backend_cmd = crew.backend_cmd, installed
         try:
             research = cfg["roles"]["research"]["agent"]
             for caller in ("claude", "codex"):
                 spec, _, _ = crew.choose_agent(cfg, research, caller=caller, quota={})
-                self.assertEqual(crew.spec_str(spec), "agy:gemini-3.8-flash-medium", caller)
+                self.assertEqual(crew.spec_str(spec), "agy:gemini-4-hydrogen-medium", caller)
             # Called from agy, research still goes to another vendor.
             spec, _, _ = crew.choose_agent(cfg, research, caller="agy", quota={})
             self.assertEqual(crew.spec_str(spec), "claude:claude-haiku-5-5@medium")

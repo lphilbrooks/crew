@@ -1,6 +1,7 @@
-"""Stand-in for the codex and agy CLIs, so tests exercise crew end to end without a vendor.
+"""Stand-in for the codex, claude, agy and opencode CLIs (and a plain command-line agent), so
+tests exercise crew end to end without a vendor.
 
-Usage: fake_agent.py codex|agy <real CLI arguments...>
+Usage: fake_agent.py codex|claude|agy|opencode|plain <real CLI arguments...>
 Behaviour switches (environment): FAKE_MODE = ok | fail | touch | deny | sleep | silent | unpriced | limited | build
 """
 import json
@@ -11,13 +12,27 @@ import time
 kind, args = sys.argv[1], sys.argv[2:]
 mode = os.environ.get("FAKE_MODE", "ok")
 # FAKE_LIMITED=codex,claude makes those backends report a usage limit, so retries can be tested.
-if kind in os.environ.get("FAKE_LIMITED", "").split(","):
+limited = os.environ.get("FAKE_LIMITED", "").split(",")
+# claude-direct: only Claude Code on Anthropic's own service, not one crew routed to a test provider.
+routed = "127.0.0.1" in os.environ.get("ANTHROPIC_BASE_URL", "")
+if kind in limited or (kind == "claude" and "claude-direct" in limited and not routed):
     mode = "limited"
 
 if "--version" in args:
-    print(f"fake-{kind} 1.0.0")
+    version = os.environ.get("FAKE_OPENCODE_VERSION") if kind == "opencode" else None
+    print(f"fake-{kind} {version or '1.0.0'}")
     sys.exit(0)
-if "--help" in args:
+if kind == "claude" and "--help" in args:
+    print(os.environ.get("FAKE_CLAUDE_HELP", "claude [options]"))
+    sys.exit(0)
+if kind == "codex" and args[:3] == ["mcp", "list", "--json"]:
+    listing = os.environ.get("FAKE_CODEX_MCP", '[{"name": "docs", "enabled": true}, {"name": "off", "enabled": false}]')
+    if listing == "fail":
+        print("error: unknown subcommand", file=sys.stderr)
+        sys.exit(2)
+    print(listing)
+    sys.exit(0)
+if "--help" in args and not (kind == "opencode" and args[:1] == ["run"]):  # opencode run --help is below
     print(f"usage: fake-{kind} [options]")
     sys.exit(0)
 
@@ -67,7 +82,10 @@ if kind == "codex":
 
 if kind == "claude":
     prompt = sys.stdin.read()
-    env_seen = {k: bool(os.environ.get(k)) for k in ("CLAUDECODE", "CREW_TASK_DIR")}
+    env_seen = {k: bool(os.environ.get(k)) for k in ("CLAUDECODE", "CREW_TASK_DIR", "ANTHROPIC_AUTH_TOKEN",
+                                                     "ANTHROPIC_API_KEY")}
+    if os.environ.get("ANTHROPIC_BASE_URL"):
+        env_seen["base_url"] = os.environ["ANTHROPIC_BASE_URL"]
     answer = os.environ.get("FAKE_ANSWER") or f"fake claude answer; argv={json.dumps(args)}; prompt_chars={len(prompt)}; env={json.dumps(env_seen)}"
     denials = [{"tool_name": "Bash", "tool_input": {"command": "rm -rf x"}}] if mode == "deny" else []
     events = [
@@ -107,4 +125,52 @@ if kind == "agy":
         sys.exit(0)
     if mode != "silent":
         print(f"fake agy answer; argv={json.dumps(args[:-1])}; prompt_chars={len(prompt)}")
+    sys.exit(3 if mode == "fail" else 0)
+
+if kind == "opencode":
+    if args[:2] == ["run", "--help"]:
+        print("opencode run [message..]\n  -m, --model\n  -s, --session\n  --format\n  --variant\n  -f, --file")
+        sys.exit(0)
+    if args[:1] == ["models"]:
+        print("openrouter/deepseek/deepseek-v4\nanthropic/claude-sonnet-5-5")
+        sys.exit(0)
+    prompt = sys.stdin.read()
+    model = args[args.index("-m") + 1]
+    session = args[args.index("-s") + 1] if "-s" in args else "ses_fake1"
+    perm = json.loads(os.environ.get("OPENCODE_CONFIG_CONTENT") or "{}").get("permission") or {}
+
+    def ev(kind_, **part):
+        print(json.dumps({"type": kind_, "sessionID": session, "part": part}), flush=True)
+
+    if mode == "limited":
+        print(json.dumps({"type": "error", "sessionID": session,
+                          "error": {"name": "APIError", "data": {"message": "429 Too Many Requests: rate limit"}}}))
+        sys.exit(1)
+    ev("step_start")
+    ev("tool_use", tool="read", state={"status": "completed", "input": {"filePath": "a.txt"}, "output": "one"})
+    if mode == "deny":
+        ev("tool_use", tool="bash", state={"status": "error", "input": {"command": "rm -rf x"},
+                                           "error": "The user has specified a rule which prevents you from using "
+                                                    "this specific tool call (permission denied)"})
+    if mode == "fail":
+        print(json.dumps({"type": "error", "sessionID": session, "error": {"name": "UnknownError",
+                                                                         "data": {"message": "boom"}}}))
+        sys.exit(1)
+    if mode not in ("silent", "deny"):
+        ev("text", text=f"fake opencode answer; model={model}; argv={json.dumps(args)}; "
+                        f"prompt_chars={len(prompt)}; edit={perm.get('edit')}; bash={perm.get('bash')}; "
+                        f"webfetch={perm.get('webfetch')}; pwd={os.environ.get('PWD')}; "
+                        f"db={bool(os.environ.get('OPENCODE_DB'))}")
+    ev("step_finish", tokens={"input": 30, "output": 12, "reasoning": 3, "cache": {"read": 5, "write": 2}},
+       cost=0.0042)
+    sys.exit(0)
+
+if kind == "plain":
+    prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
+    if mode == "stall":
+        print("started", flush=True)
+        time.sleep(600)
+    if mode == "touch":
+        sys.exit(0)
+    print(f"fake plain answer; argv={json.dumps(args)}; stdin_chars={len(prompt)}")
     sys.exit(3 if mode == "fail" else 0)

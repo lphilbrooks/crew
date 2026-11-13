@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """crew: hand bounded tasks to other vendors' coding-agent CLIs.
 
-Backends: OpenAI Codex CLI (`codex`), Anthropic Claude Code (`claude`) and
-Google Antigravity CLI (`agy`). The caller chooses each task's permission scope
+Backends: OpenAI Codex CLI (`codex`), Anthropic Claude Code (`claude`), Google
+Antigravity CLI (`agy`), OpenCode (`opencode`, any provider it supports), direct
+OpenAI-compatible APIs (`api`: OpenRouter, DeepSeek, Groq, Ollama, ...) and any
+command-line agent defined in the config. Claude Code and Codex can also be routed
+to other providers (`claude+openrouter:...`). The caller chooses each task's permission scope
 (--access, --web, --network); crew maps it onto the backend's own controls,
 runs the agent in its own process (optionally in a visible terminal tab) and
 leaves a record of the run on disk.
@@ -42,7 +45,7 @@ LEDGER = CREW_HOME / "ledger.jsonl"
 
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
-BACKENDS = ("codex", "claude", "agy")
+BACKENDS = ("codex", "claude", "agy", "opencode", "api")  # built in; the config can define more
 ACCESS_LEVELS = ("read", "verify", "write")
 HEARTBEAT_SEC = 5
 STALE_SEC = 30
@@ -54,6 +57,7 @@ BRIEF_LINES = 40
 BRIEF_CHARS = 4000
 HASH_LIMIT = 64 * 1024 * 1024
 AGY_INLINE_LIMIT = 8000
+INLINE_PROMPT_LIMIT = AGY_INLINE_LIMIT  # longer prompts go by file, under the Windows command-line limit
 REVIEW_EMBED_LIMIT = 200_000
 UNTRACKED_EMBED_LIMIT = 100 * 1024
 # Untracked files a review never pastes into a prompt, matched against the lowercased file name.
@@ -166,16 +170,49 @@ def save_user_config(data: dict) -> None:
 
 # ------------------------------------------------------------ agents / models
 
-SPEC_RE = re.compile(r"^(codex|claude|agy):([^@\s]+?)(?:@([a-z]+))?$")
+# backend[+provider]:model[@effort]. The model may itself hold ':', '/' and '@' (ollama tags, opencode's
+# provider/model ids, Vertex dates), so only the first ':' ends the backend and only a final
+# all-letter '@word' is an effort.
+SPEC_RE = re.compile(r"^([a-z][a-z0-9_-]*)(?:\+([a-z0-9][a-z0-9_.-]*))?:(\S+?)(?:@([a-z]+))?$")
 
 
 def parse_spec(text):
     m = SPEC_RE.match(str(text).strip())
-    return {"backend": m[1], "model": m[2], "effort": m[3]} if m else None
+    if not m:
+        return None
+    spec = {"backend": m[1], "model": m[3], "effort": m[4]}
+    if m[2]:
+        spec["provider"] = m[2]
+    return spec
 
 
 def spec_str(spec: dict) -> str:
-    return f"{spec['backend']}:{spec['model']}" + (f"@{spec['effort']}" if spec.get("effort") else "")
+    return (f"{spec['backend']}" + (f"+{spec['provider']}" if spec.get("provider") else "")
+            + f":{spec['model']}" + (f"@{spec['effort']}" if spec.get("effort") else ""))
+
+
+def known_backends(cfg: dict) -> tuple:
+    """Built-in backends plus command-line agents the config defines (backends.<name>.command)."""
+    extra = [name for name, b in (cfg.get("backends") or {}).items()
+             if name not in BACKENDS and isinstance(b, dict) and b.get("command")]
+    return BACKENDS + tuple(extra)
+
+
+def check_spec(cfg: dict, spec: dict, text) -> dict:
+    """Raise for a spec whose backend or provider crew doesn't know."""
+    backend, provider = spec["backend"], spec.get("provider")
+    if backend not in known_backends(cfg):
+        raise CrewError(f"Unknown backend '{backend}' in '{text}' (known: {', '.join(known_backends(cfg))}; "
+                        "define others under backends.<name>.command)")
+    if provider:
+        if backend not in ("claude", "codex"):
+            raise CrewError(f"'{text}': only claude and codex take +provider; "
+                            f"{backend} names the provider in the model, e.g. {backend}:openrouter/<model>")
+        if provider not in providers(cfg):
+            raise CrewError(f"Unknown provider '{provider}' in '{text}' (known: {', '.join(providers(cfg))})")
+    if backend == "api" and "/" not in spec["model"]:
+        raise CrewError(f"'{text}': api agents are written api:<provider>/<model>, e.g. api:openrouter/<model>")
+    return spec
 
 
 def expand_agent(cfg: dict, ref, _seen=()) -> list:
@@ -187,7 +224,7 @@ def expand_agent(cfg: dict, ref, _seen=()) -> list:
         return [s for r in ref for s in expand_agent(cfg, r, _seen)]
     spec = parse_spec(ref)
     if spec:
-        return [spec]
+        return [check_spec(cfg, spec, ref)]
     agents = cfg.get("agents") or {}
     if ref in agents and ref not in _seen:
         return expand_agent(cfg, agents[ref], _seen + (ref,))
@@ -196,7 +233,8 @@ def expand_agent(cfg: dict, ref, _seen=()) -> list:
         return [spec]
     raise CrewError(
         f"Unknown agent '{ref}'. Use a model name from `crew.py models` (e.g. gemini-flash@medium), "
-        f"backend:model[@effort] (backend: {', '.join(BACKENDS)}), or an alias: {', '.join(agents) or '(none defined)'}")
+        f"backend[+provider]:model[@effort] (backend: {', '.join(known_backends(cfg))}), "
+        f"or an alias: {', '.join(agents) or '(none defined)'}")
 
 
 # ------------------------------------------------------------------- catalogue
@@ -279,25 +317,156 @@ def settle_effort(cfg: dict, spec: dict, effort):
 
 def backend_cmd(cfg: dict, backend: str):
     """argv prefix that launches a backend, or None if it is not installed."""
-    exe = ((cfg.get("backends") or {}).get(backend) or {}).get("exe")
+    if backend == "api":  # crew itself makes the request
+        return [sys.executable, "-u", str(Path(__file__).resolve()), "_api"]
+    bcfg = (cfg.get("backends") or {}).get(backend) or {}
+    exe = bcfg.get("exe")
+    if not exe and isinstance(bcfg.get("command"), list) and bcfg["command"]:
+        exe = bcfg["command"][0]
     if isinstance(exe, list):
         return list(exe)
     name = os.path.expanduser(exe) if exe else backend
     found = name if Path(name).is_file() else shutil.which(name)
+    if found and IS_WIN and found.lower().endswith((".cmd", ".bat")):
+        return windows_shim_target(found) or [found]
     return [found] if found else None
+
+
+def windows_shim_target(shim: str):
+    """What an npm/pnpm .cmd shim runs, as an argv prefix, or None if it isn't recognised. Running
+    the target directly keeps cmd.exe, which reinterprets &, |, % and newlines, out of the way.
+    The shim's last line that passes %* on names the target as a quoted "%dp0%" path."""
+    try:
+        content = Path(shim).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [line for line in content.splitlines() if "%*" in line]
+    if not lines:
+        return None
+    paths = [m for m in re.findall(r'"(%~?dp0%?[^"]*)"', lines[-1], re.I) if not m.lower().endswith("node.exe")]
+    if not paths:
+        return None
+    rel = re.sub(r"^%~?dp0%?\\?", "", paths[-1], flags=re.I).replace("\\", os.sep)
+    target = os.path.normpath(os.path.join(os.path.dirname(shim), rel))
+    if not Path(target).is_file():
+        return None
+    if target.lower().endswith((".exe", ".com")):
+        return [target]
+    if not re.search(r"node(\.exe)?\b", lines[-1], re.I) and "%_prog%" not in lines[-1].lower():
+        return None  # run by something other than node
+    local = Path(shim).with_name("node.exe")
+    node = str(local) if local.is_file() else shutil.which("node")
+    return [node, target] if node else None
+
+
+# ------------------------------------------------------------------ providers
+
+# Providers are model APIs. `api` agents call them directly (api:<provider>/<model>); claude and
+# codex agents can be pointed at them (claude+<provider>:<model>) when the provider offers an
+# Anthropic-compatible (anthropic_url) or Responses-compatible (responses) endpoint. opencode
+# manages its own providers; its model ids start with the provider (opencode:openrouter/...).
+KEYS_FILE = CREW_HOME / "keys.json"
+
+
+def providers(cfg: dict) -> dict:
+    return {k: v for k, v in (cfg.get("providers") or {}).items() if isinstance(v, dict) and not k.startswith("_")}
+
+
+def spec_provider(spec: dict):
+    """The provider a spec runs on: +provider for claude/codex, the model's first segment for
+    opencode and api, else None (the backend's own service)."""
+    if spec.get("provider"):
+        return spec["provider"]
+    if spec["backend"] in ("opencode", "api") and "/" in spec["model"]:
+        return spec["model"].split("/", 1)[0]
+    return None
+
+
+def api_model(spec: dict) -> str:
+    """The model id sent to an api agent's provider (the part after 'provider/')."""
+    return spec["model"].split("/", 1)[1] if "/" in spec["model"] else spec["model"]
+
+
+AGY_EFFORT_SUFFIX = re.compile(r"-(none|minimal|low|medium|high|xhigh|max)$")
+
+
+def quota_key(spec: dict) -> str:
+    """Usage limits belong to whoever bills the request: the provider when there is one. agy's limits
+    are per model (Gemini 4 Argon has its own weekly quota, separate from Hydrogen and Flash), so a
+    limit on one agy model leaves the others available as fallbacks. The effort suffix is dropped."""
+    provider = spec_provider(spec)
+    if provider:
+        return provider
+    if spec["backend"] == "agy" and spec.get("model"):
+        return "agy:" + AGY_EFFORT_SUFFIX.sub("", spec["model"])
+    return spec["backend"]
+
+
+def read_keys() -> dict:
+    try:
+        data = read_json(KEYS_FILE)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_secret(var: str):
+    """An API key: from the environment, else from ~/.crew/keys.json (`crew.py set-key`). The file
+    matters for visible tabs, which may not inherit the caller's environment."""
+    if not var:
+        return None
+    return os.environ.get(var) or read_keys().get(var) or None
+
+
+def provider_unavailable(cfg: dict, spec: dict):
+    """Why this spec's provider can't be used now, or None when it can."""
+    name = spec_provider(spec)
+    if not name or spec["backend"] == "opencode":  # opencode keeps its own provider logins
+        return None
+    pcfg = providers(cfg).get(name)
+    if pcfg is None:
+        return f"unknown provider '{name}'"
+    allowed = pcfg.get("allowed_models")
+    model = api_model(spec) if spec["backend"] == "api" else spec["model"]
+    if allowed and model not in allowed:
+        return f"model {model} is not in providers.{name}.allowed_models"
+    if spec["backend"] == "api" and not pcfg.get("base_url"):
+        return f"provider {name} has no OpenAI-compatible endpoint (base_url) for api agents"
+    if spec["backend"] == "claude" and not pcfg.get("anthropic_url"):
+        return f"provider {name} has no Anthropic-compatible endpoint (anthropic_url) for claude"
+    if spec["backend"] == "codex" and not pcfg.get("responses"):
+        return f"provider {name} has no Responses API for codex (set providers.{name}.responses if it does)"
+    if pcfg.get("key_env") and not read_secret(pcfg["key_env"]):
+        return f"no API key: set {pcfg['key_env']} or run `crew.py set-key {name}`"
+    return None
 
 
 def detect_caller():
     """Which agent is running crew: CREW_CALLER, else environment markers, else None."""
-    explicit = os.environ.get("CREW_CALLER", "").strip().lower()
+    explicit = os.environ.get("CREW_CALLER", "").strip()
     if explicit:
-        return explicit if explicit in BACKENDS else None
+        return explicit if valid_caller(explicit) else None
     for backend, markers in CALLER_MARKERS.items():
         if any(os.environ.get(m) for m in markers):
             return backend
     if any(os.environ.get(m) for m in ("CODEX_MANAGED_BY_NPM", "CODEX_MANAGED_BY_BUN", "CODEX_MANAGED_BY_PNPM")):
         return "codex"
     return None
+
+
+def valid_caller(caller: str) -> bool:
+    """A caller is a backend name, or backend:model when the backend runs many families (opencode)."""
+    return caller in CALLER_FAMILY or caller in BACKENDS or bool(parse_spec(caller))
+
+
+def caller_family(caller):
+    """The caller's model family, or None when it can't be known (e.g. opencode without a model)."""
+    if not caller:
+        return None
+    spec = parse_spec(caller)
+    if spec:
+        return model_family(spec)
+    return CALLER_FAMILY.get(caller)
 
 
 def caller_session():
@@ -323,24 +492,31 @@ def candidates_for(cfg: dict, ref, caller=None, balance=False, quota=None, expli
     remaining headroom, keeping the configured order among similar ones. Each filter is skipped
     rather than leaving no candidate at all."""
     candidates = expand_agent(cfg, ref)
-    installed = [(s, c) for s, c in ((s, backend_cmd(cfg, s["backend"])) for s in candidates) if c]
+    installed, missing = [], []
+    for s in candidates:
+        c = backend_cmd(cfg, s["backend"])
+        why = None if c else f"{s['backend']} not installed"
+        why = why or provider_unavailable(cfg, s)
+        if why:
+            missing.append(f"{spec_str(s)}: {why}")
+        else:
+            installed.append((s, c))
     if not installed:
         raise CrewError(
-            f"No installed backend for agent '{ref}' (tried {', '.join(map(spec_str, candidates))}). "
-            "Run `crew.py doctor`.")
+            f"No installed backend for agent '{ref}' ({'; '.join(missing)}). Run `crew.py doctor`.")
     if explicit:
         return [(installed[0][0], installed[0][1], None)]
     notes = []
-    family = CALLER_FAMILY.get(caller)
+    family = caller_family(caller)
     if family:
-        others = [(s, c) for s, c in installed if model_family(s) != family]
+        others = [(s, c) for s, c in installed if model_family(s, cfg) != family]
         if others:
             installed = others
         else:
             notes.append(f"{family} is also the caller's model family; no other installed candidate for this role")
     if quota is None:
         quota = read_quota()
-    ready = [(s, c) for s, c in installed if not quota_exhausted(_quota_entry(quota, s["backend"]))]
+    ready = [(s, c) for s, c in installed if not quota_exhausted(_quota_entry(quota, quota_key(s)))]
     if ready:
         installed = ready
     else:
@@ -350,7 +526,7 @@ def candidates_for(cfg: dict, ref, caller=None, balance=False, quota=None, expli
         unknown = float(cfg.get("unknown_quota", 0.5))
 
         def bucket(item):
-            score = quota_score(_quota_entry(quota, item[0]["backend"]))
+            score = quota_score(_quota_entry(quota, quota_key(item[0])))
             return (unknown if score is None else score) // step
 
         installed = sorted(installed, key=bucket)
@@ -403,8 +579,9 @@ def cli_help(cmd: list) -> str:
 
 # ---------------------------------------------------------------------- quota
 
-# Model families. agy runs Claude, GPT and Gemini models, so its family comes from the model
-# name; a Claude Code caller should not count an agy Claude model as a second vendor.
+# Model families. agy, opencode and api agents run many vendors' models, so their family comes
+# from the model name; a Claude Code caller should not count an agy Claude model as a second vendor.
+# opencode can run any family, so as a caller it passes its model: --caller opencode:<provider/model>.
 CALLER_FAMILY = {"codex": "openai", "claude": "anthropic", "agy": "google"}
 QUOTA_FILE = CREW_HOME / "quota.json"
 CODEX_DAY_LIMIT = 400  # newest session-log day folders searched for a task's session
@@ -412,19 +589,66 @@ CODEX_WINDOW_NAMES = {300: "five_hour", 10080: "seven_day"}
 LIMIT_RE = re.compile(
     r"hit your (?:\w+ )?usage limit|usage limit (?:reached|exceeded)"
     r"|\brate[ _-]?limit(?:ed)?\b|rate_limit_error|too many requests|quota exceeded|resource[ _]exhausted"
-    r"|\b(?:status|http|error|code)\W{0,3}429\b|\b429\b\s*(?:too many|rate|quota)",
+    r"|\b(?:status|http|error|code)\W{0,3}429\b|\b429\b\s*(?:too many|rate|quota)"
+    r"|insufficient (?:credits|balance|quota)|\b402\b\s*payment required",
     re.IGNORECASE)
 
 
-def model_family(spec: dict) -> str:
-    if spec["backend"] == "agy":
-        model = spec["model"].lower()
-        if model.startswith("claude"):
-            return "anthropic"
-        if model.startswith("gpt"):
-            return "openai"
+# Model-name prefixes and organisation names (as in OpenRouter or Hugging Face ids) -> family.
+# A second opinion should come from a different family, whichever CLI or provider serves it.
+MODEL_PREFIX_FAMILY = (
+    ("claude", "anthropic"), ("gpt", "openai"), ("chatgpt", "openai"), ("codex", "openai"), ("o1", "openai"),
+    ("o3", "openai"), ("o4", "openai"), ("gemini", "google"), ("gemma", "google"), ("deepseek", "deepseek"),
+    ("qwen", "alibaba"), ("qwq", "alibaba"), ("kimi", "moonshot"), ("moonshot", "moonshot"), ("glm", "zhipu"),
+    ("grok", "xai"), ("mistral", "mistral"), ("mixtral", "mistral"), ("codestral", "mistral"),
+    ("devstral", "mistral"), ("magistral", "mistral"), ("ministral", "mistral"), ("pixtral", "mistral"),
+    ("llama", "meta"), ("minimax", "minimax"), ("command", "cohere"), ("nemotron", "nvidia"),
+    ("phi", "microsoft"), ("ernie", "baidu"), ("hunyuan", "tencent"), ("doubao", "bytedance"),
+    ("seed", "bytedance"), ("mimo", "xiaomi"), ("step", "stepfun"), ("nova", "amazon"), ("granite", "ibm"),
+    ("olmo", "allenai"), ("jamba", "ai21"), ("sonar", "perplexity"))
+ORG_FAMILY = {
+    "anthropic": "anthropic", "openai": "openai", "google": "google", "deepseek": "deepseek",
+    "deepseek-ai": "deepseek", "qwen": "alibaba", "alibaba": "alibaba", "moonshotai": "moonshot",
+    "moonshot": "moonshot", "z-ai": "zhipu", "zai": "zhipu", "zai-org": "zhipu", "thudm": "zhipu",
+    "x-ai": "xai", "xai": "xai", "mistralai": "mistral", "mistral": "mistral", "meta-llama": "meta",
+    "meta": "meta", "minimax": "minimax", "minimaxai": "minimax", "cohere": "cohere", "nvidia": "nvidia",
+    "microsoft": "microsoft", "amazon": "amazon", "ibm-granite": "ibm", "perplexity": "perplexity",
+    "baidu": "baidu", "tencent": "tencent", "bytedance": "bytedance", "bytedance-seed": "bytedance",
+    "xiaomi": "xiaomi", "stepfun-ai": "stepfun", "allenai": "allenai", "ai21": "ai21"}
+
+
+def family_from_name(model: str):
+    """Family from a model id such as 'openrouter/anthropic/claude-x:free', or None if unknown."""
+    segments = [seg.lstrip("~") for seg in model.lower().split("/") if seg]
+    if not segments:
+        return None
+    name = re.split(r"[:#]", segments[-1])[0]  # drop ollama tags, OpenRouter variants, opencode efforts
+    for prefix, family in MODEL_PREFIX_FAMILY:
+        if re.match(re.escape(prefix) + r"(?![a-z])", name):
+            return family
+    for seg in reversed(segments[:-1]):
+        if seg in ORG_FAMILY:
+            return ORG_FAMILY[seg]
+    return None
+
+
+def model_family(spec: dict, cfg=None) -> str:
+    """The model's maker. codex and claude on their own service are openai and anthropic; anything
+    else (agy, opencode, api, a +provider route, config-defined CLIs) goes by the model name, then
+    by the provider's or backend's configured family."""
+    backend = spec["backend"]
+    if backend in ("codex", "claude") and not spec.get("provider"):
+        return {"codex": "openai", "claude": "anthropic"}[backend]
+    found = family_from_name(spec["model"])
+    if found:
+        return found
+    if backend == "agy":
         return "google"
-    return {"codex": "openai", "claude": "anthropic"}.get(spec["backend"], spec["backend"])
+    cfg = cfg if cfg is not None else load_config()
+    provider = spec_provider(spec)
+    pcfg = providers(cfg).get(provider) if provider else None
+    bcfg = (cfg.get("backends") or {}).get(backend) or {}
+    return (pcfg or {}).get("family") or bcfg.get("family") or provider or backend
 
 
 def read_quota() -> dict:
@@ -628,10 +852,41 @@ def claude_has_sandbox() -> bool:
     return not IS_WIN
 
 
-def enforcement(backend: str, scope: dict, has_git: bool, agy_fetch: bool) -> dict:
-    """How each scope dimension is enforced. Raises for scopes a backend cannot honour."""
+def enforcement(backend: str, scope: dict, has_git: bool, agy_fetch: bool, bcfg=None) -> dict:
+    """How each scope dimension is enforced. Raises for scopes a backend cannot honour.
+    `bcfg` is the backend's config entry (needed for config-defined command backends)."""
     access, web, net = scope["access"], scope["web"], scope["network"]
     detect = "git before/after check" if has_git else "nothing (not a git repo, so changes cannot be detected)"
+    if backend == "opencode":
+        files = {"read": "opencode permissions: read/search tools only; edit and bash denied",
+                 "verify": f"opencode permissions: bash allowed, edit denied; bash has no OS sandbox, so "
+                           f"repository writes are limited by instructions + {detect}",
+                 "write": "opencode permissions: edit and bash allowed"}[access]
+        network = ("n/a (bash denied)" if access == "read"
+                   else "not enforced (opencode has no sandbox): instructions only")
+        return {"files": files, "web": f"opencode webfetch/websearch permissions {'allow' if web else 'deny'}",
+                "network": network}
+    if backend == "api":
+        if access == "write":
+            raise CrewError("api agents have no tools, so they cannot edit files. Use an opencode, codex or "
+                            "claude agent for --access write.")
+        if web:
+            raise CrewError("api agents have no tools, so they cannot search the web. Use --no-web, or an "
+                            "opencode, codex or claude agent.")
+        files = "none needed: the model sees only the task text (no tools)" + (
+            "; verify runs read-only, since it cannot build or test" if access == "verify" else "")
+        return {"files": files, "web": "n/a (no tools)", "network": "n/a (no tools)"}
+    if backend not in BACKENDS:  # a command-line agent defined in the config
+        bcfg = bcfg or {}
+        supported = bcfg.get("access") or ["read"]
+        if access not in supported:
+            raise CrewError(f"backend {backend} is configured for --access {' | '.join(supported)} only "
+                            f"(backends.{backend}.access)")
+        how = (bcfg.get("enforcement") or {}).get(access)
+        files = how or f"instructions + {detect}"
+        return {"files": files,
+                "web": (bcfg.get("enforcement") or {}).get("web") or "instructions only",
+                "network": "n/a (no shell)" if access == "read" else "not enforced: instructions only"}
     if backend == "codex":
         files = {"read": "codex read-only sandbox",
                  "verify": f"codex workspace-write sandbox + instructions + {detect}",
@@ -670,6 +925,11 @@ def enforcement(backend: str, scope: dict, has_git: bool, agy_fetch: bool) -> di
 def scope_preamble(backend: str, scope: dict, scratch: Path, top, agy_fetch: bool) -> str:
     access, web, net = scope["access"], scope["web"], scope["network"]
     lines = ["[crew task scope]"]
+    if backend == "api":
+        lines.append("You have no tools: you cannot read files, run commands or browse. Work only from the "
+                     "text of this task. Where a claim can't be settled from that text, say what would need "
+                     "checking and how.")
+        return "\n".join(lines)
     if access == "read":
         lines.append("Read-only: do not create, modify or delete any file. Put everything in your answer.")
     elif access == "verify":
@@ -684,7 +944,7 @@ def scope_preamble(backend: str, scope: dict, scratch: Path, top, agy_fetch: boo
                      "or type-check) and report their results. If a check could not run, say which and why.")
     if access != "read":
         lines.append("Do not run git add, commit, push, checkout, reset, stash or clean; leave changes uncommitted.")
-    if backend in ("codex", "claude") and access != "read":
+    if backend not in ("agy", "api") and access != "read":
         lines.append("Network access for commands: " + ("available." if net else "not available; do not try to install packages."))
     if backend == "agy":
         lines.append("Do not run terminal commands; they are denied in this headless mode.")
@@ -922,9 +1182,43 @@ def codex_windows_sandbox():
     return m[1] if m else None
 
 
+SAFE_MCP_NAME = re.compile(r"^[^\s.=\"'\x00-\x1f](?:[^.=\"'\x00-\x1f]*[^\s.=\"'\x00-\x1f])?$")
+
+
+def codex_isolation(cfg: dict, cmd: list):
+    """(-c options, enforcement note) that keep the user's MCP servers and plugins out of a codex
+    run. Codex runs MCP tools outside its shell sandbox, so a read-only task could still write
+    through one. Plugins bring their own servers; each server still enabled is disabled by name."""
+    opts = ["-c", "features.plugins=false"]
+    if ((cfg.get("backends") or {}).get("codex") or {}).get("ignore_user_config"):
+        return opts, "none: your codex config (and its MCP servers) is skipped"
+    try:
+        r = subprocess.run(cmd + ["mcp", "list", "--json"] + opts, capture_output=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        listed = json.loads(r.stdout.decode("utf-8", "replace")) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        listed = None
+    if not isinstance(listed, list):
+        return opts, ("could not list your codex MCP servers (`codex mcp list --json`), so any you have stay "
+                      "enabled and run outside codex's sandbox; set backends.codex.ignore_user_config to skip them")
+    names = []
+    for entry in listed:
+        if not isinstance(entry, dict) or entry.get("enabled") is not True or not isinstance(entry.get("name"), str):
+            continue
+        if not SAFE_MCP_NAME.match(entry["name"]):
+            raise CrewError(f"codex MCP server {entry['name'][:80]!r} can't be disabled safely by name; "
+                            "rename or disable it, or set backends.codex.ignore_user_config")
+        names.append(entry["name"])
+    for name in names:
+        opts += ["-c", f"mcp_servers.{name}.enabled=false"]
+    return opts, (f"your {len(names)} codex MCP server(s) disabled for this run" if names
+                  else "none enabled in your codex config") + "; plugins off"
+
+
 def codex_args(cfg, spec, effort, scope, task: Path, cwd: Path, mode: str, target=None, session=None,
-               extra_write=()) -> list:
+               extra_write=(), isolation=()) -> list:
     opts = ["--json", "--skip-git-repo-check", "-m", spec["model"], "-o", str(task / "final.md")]
+    opts += list(isolation)
     if ((cfg.get("backends") or {}).get("codex") or {}).get("ignore_user_config"):
         opts.append("--ignore-user-config")
         ws = codex_windows_sandbox()
@@ -932,6 +1226,15 @@ def codex_args(cfg, spec, effort, scope, task: Path, cwd: Path, mode: str, targe
             opts += ["-c", f"windows.sandbox={toml_str(ws)}"]
     if effort:
         opts += ["-c", f"model_reasoning_effort={toml_str(effort)}"]
+    provider = spec.get("provider")
+    if provider:  # codex on another provider: a model_providers entry built from crew's providers table
+        pcfg, pid = providers(cfg)[provider], f"crew-{provider}"
+        opts += ["-c", f"model_provider={toml_str(pid)}",
+                 "-c", f"model_providers.{pid}.name={toml_str(provider)}",
+                 "-c", f"model_providers.{pid}.base_url={toml_str(pcfg['base_url'])}",
+                 "-c", f"model_providers.{pid}.wire_api={toml_str('responses')}"]
+        if pcfg.get("key_env"):
+            opts += ["-c", f"model_providers.{pid}.env_key={toml_str(pcfg['key_env'])}"]
     opts += ["-c", f"web_search={toml_str('live' if scope['web'] else 'disabled')}"]
     if mode == "resume":  # resume inherits the original session's sandbox and root
         return ["exec", "resume"] + opts + [session, "-"]
@@ -1006,6 +1309,121 @@ def agy_args(spec, effort, scope, task: Path, cwd: Path, text: str) -> list:
         prompt = (f"Your full instructions are in the file {task / 'task.md'} . "
                   "Read that file completely and follow it exactly.")
     return args + ["-p", prompt]
+
+
+def claude_provider_env(cfg: dict, spec: dict):
+    """(plain env, secret env) that point claude at a provider's Anthropic-compatible endpoint.
+    Secret env maps a variable to the key's source variable; it is resolved when the agent starts,
+    so the key is never written into cmd.json."""
+    pcfg = providers(cfg)[spec["provider"]]
+    model = spec["model"]
+    env = {"ANTHROPIC_BASE_URL": pcfg["anthropic_url"], "ANTHROPIC_API_KEY": "",
+           # Claude Code's helper and subagent models would otherwise ask the provider for Anthropic ids.
+           "ANTHROPIC_MODEL": model, "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+           "ANTHROPIC_DEFAULT_SONNET_MODEL": model, "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+           "CLAUDE_CODE_SUBAGENT_MODEL": model}
+    # Most Anthropic-compatible endpoints take the key as a bearer token (ANTHROPIC_AUTH_TOKEN); some
+    # want it as ANTHROPIC_API_KEY instead (providers.<name>.auth_env).
+    auth = pcfg.get("auth_env") or "ANTHROPIC_AUTH_TOKEN"
+    if auth != "ANTHROPIC_AUTH_TOKEN":
+        env.pop("ANTHROPIC_API_KEY", None)
+        env["ANTHROPIC_AUTH_TOKEN"] = None  # None removes it from the agent's environment
+    secret = {}
+    if pcfg.get("key_env"):
+        secret[auth] = pcfg["key_env"]
+    else:
+        env[auth] = spec["provider"]  # local servers want some token and ignore it
+    return env, secret
+
+
+def opencode_config(scope: dict) -> dict:
+    """A per-task opencode config: the permission rules are the scope. '*' denies every tool not
+    named here (MCP tools and subagents included), so nothing is left to an 'ask' prompt that a
+    headless run cannot answer."""
+    access, web = scope["access"], scope["web"]
+    yes = lambda on: "allow" if on else "deny"  # noqa: E731
+    perm = {"*": "deny", "read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "lsp": "allow",
+            "todoread": "allow", "todowrite": "allow",
+            "edit": yes(access == "write"), "bash": yes(access != "read"),
+            "external_directory": yes(access != "read"),
+            "webfetch": yes(web), "websearch": yes(web), "codesearch": yes(web)}
+    return {"$schema": "https://opencode.ai/config.json", "permission": perm, "share": "disabled",
+            "autoupdate": False}
+
+
+_version_cache = {}
+
+
+def cli_version(cmd: list):
+    """(major, minor) from `<cmd> --version`, or None if it can't be read."""
+    key = tuple(cmd)
+    if key not in _version_cache:
+        try:
+            r = subprocess.run(cmd + ["--version"], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+            m = re.search(r"(\d+)\.(\d+)", (r.stdout + r.stderr).decode("utf-8", "replace"))
+            _version_cache[key] = (int(m[1]), int(m[2])) if m else None
+        except (OSError, subprocess.TimeoutExpired):
+            _version_cache[key] = None
+    return _version_cache[key]
+
+
+def opencode_args(cmd: list, spec, effort, session=None):
+    """argv tail for `opencode run`, plus a note when the effort can't be passed. The prompt goes
+    on stdin, which avoids quoting problems and Windows' cmd.exe.
+
+    OpenCode 2 runs sessions through a shared background server that owns configuration and
+    permissions, so a run's own environment (crew's permission config) is ignored there unless
+    the run gets a private server: --standalone. It also takes effort as a model variant
+    (provider/model#effort) instead of 1.x's --variant flag."""
+    version = cli_version(cmd)
+    v2 = bool(version and version[0] >= 2)
+    model, note = spec["model"], None
+    args = ["run"]
+    if v2:
+        args.append("--standalone")
+        if effort and "#" not in model:
+            model = f"{model}#{effort}"
+    args += ["--format", "json", "-m", model]
+    if effort and not v2:
+        if "--variant" in cli_help(cmd + ["run"]):
+            args += ["--variant", effort]
+        else:
+            note = f"this opencode has no --variant flag, so effort={effort} was not passed"
+    if session:
+        args += ["-s", session]
+    return args, note
+
+
+def command_args(bcfg: dict, spec, effort, scope, task: Path, cwd: Path, text: str):
+    """argv tail and stdin use for a command-line agent defined in the config.
+
+    backends.<name>.command is an argv template; {model}, {prompt}, {task_file}, {cwd} and {scratch}
+    are filled in. Without {prompt} or {task_file} the prompt goes to stdin. effort_args, access_args
+    (per access level) and web_args are added when they apply."""
+    prompt = text
+    if len(text) > INLINE_PROMPT_LIMIT:
+        prompt = (f"Your full instructions are in the file {task / 'task.md'} . "
+                  "Read that file completely and follow it exactly.")
+    values = {"model": spec["model"], "effort": effort or "", "prompt": prompt,
+              "task_file": str(task / "task.md"), "cwd": str(cwd), "scratch": str(task / "scratch")}
+
+    def fill(items):
+        out = []
+        for item in items or []:
+            item = str(item)
+            for key, value in values.items():
+                item = item.replace("{" + key + "}", value)
+            out.append(item)
+        return out
+
+    template = list(bcfg["command"][1:])
+    if effort:
+        template += list(bcfg.get("effort_args") or [])
+    template += list((bcfg.get("access_args") or {}).get(scope["access"]) or [])
+    if scope["web"]:
+        template += list(bcfg.get("web_args") or [])
+    use_stdin = not any("{prompt}" in str(t) or "{task_file}" in str(t) for t in template)
+    return fill(template), use_stdin
 
 
 # --------------------------------------------------------------- launching
@@ -1254,6 +1672,10 @@ def print_result(task: Path, brief: bool = False) -> int:
         print("crew: changed during this run by other crew write runs (not counted as violations):")
         for p in r["concurrent_changes"]:
             print(f"  {p}")
+    wt = r.get("worktree")
+    if wt and wt.get("kept"):
+        print(f"crew: worktree {wt['path']} (branch {wt['branch']}); merge or cherry-pick it, then "
+              f"`git worktree remove {wt['path']}`")
     if r.get("touched_files"):
         print("crew: touched files (relative to the repository root):")
         for p in r["touched_files"]:
@@ -1307,6 +1729,13 @@ def read_task_text(args) -> str:
     return text.strip()
 
 
+def caller_arg(text: str) -> str:
+    if text == "none" or valid_caller(text):
+        return text
+    raise argparse.ArgumentTypeError(f"'{text}' is not a caller: use codex, claude, agy, opencode:<provider/model> "
+                                     "(any backend:model), or none")
+
+
 def resolve_caller(arg):
     if arg == "none":
         return None
@@ -1314,7 +1743,7 @@ def resolve_caller(arg):
 
 
 REQUEST_KEYS = ("role", "agent", "model", "effort", "cd", "access", "web", "network", "target", "slug",
-                "max_minutes", "caller", "view", "hold", "timeout")
+                "max_minutes", "caller", "view", "hold", "timeout", "worktree", "max_cost", "stall_minutes")
 
 
 def cmd_run(args) -> int:
@@ -1337,7 +1766,7 @@ def cmd_run(args) -> int:
         for key in REQUEST_KEYS:
             setattr(args, key, req.get(key))
         args.caller = req.get("caller") or "none"
-        excluded = list(req.get("excluded") or []) + [prev["backend"]]
+        excluded = list(req.get("excluded") or []) + [prev.get("quota_key") or prev["backend"]]
     else:
         text = read_task_text(args)
     caller = resolve_caller(args.caller)
@@ -1366,7 +1795,7 @@ def cmd_run(args) -> int:
         options = [choose_agent(cfg, args.agent, caller, explicit=True)]
     else:
         options = [o for o in candidates_for(cfg, role_cfg.get("agent"), caller, balance=bool(role_cfg.get("balance")))
-                   if o[0]["backend"] not in excluded]
+                   if quota_key(o[0]) not in excluded]
         if not options:
             raise CrewError(f"no eligible agent for role '{args.role}' outside {', '.join(excluded)}")
         family = CALLER_FAMILY.get(caller)
@@ -1398,8 +1827,8 @@ def run_resume(cfg, args) -> int:
         pc, pr = read_json(prev / "cmd.json"), read_json(prev / "result.json")
     except (OSError, ValueError):
         raise CrewError(f"{prev} is not a finished crew task directory")
-    if pc.get("backend") not in ("codex", "claude"):
-        raise CrewError("--resume works for codex and claude tasks only")
+    if pc.get("backend") not in ("codex", "claude", "opencode", "api"):
+        raise CrewError("--resume works for codex, claude, opencode and api tasks only")
     session = pr.get("session_id")
     if not session:
         raise CrewError(f"No session id recorded in {prev / 'result.json'}")
@@ -1409,10 +1838,13 @@ def run_resume(cfg, args) -> int:
     exe = backend_cmd(cfg, spec["backend"])
     if not exe:
         raise CrewError(f"{spec['backend']} is not installed (or backends.{spec['backend']}.exe is wrong)")
+    if not Path(pc["cwd"]).is_dir():
+        raise CrewError(f"{pc['cwd']} no longer exists (a worktree is removed when its run changed nothing)")
     role = pc["role"]
     role_cfg = (cfg.get("roles") or {}).get(role) or {}
     # Results written before session_cost_usd existed stored the session total in cost_usd.
-    prior_cost = pr.get("session_cost_usd", pr.get("cost_usd"))
+    # Only claude reports a whole-session cost; opencode and api report each run's own.
+    prior_cost = pr.get("session_cost_usd", pr.get("cost_usd")) if pc.get("backend") == "claude" else None
     task = launch_task(cfg, args, role, role_cfg, spec, exe, Path(pc["cwd"]), pc["scope"], text,
                        resolve_caller(args.caller), None, session=session,
                        extra={"resumed_from": str(prev), "prior_session_cost_usd": prior_cost})
@@ -1425,7 +1857,7 @@ def run_panel(cfg, args, role_cfg, options, cwd, scope, text, caller, request) -
     """The same task to several agents from different model families at once, for comparison."""
     members, families = [], set()
     for spec, exe, note in options:
-        family = model_family(spec)
+        family = model_family(spec, cfg)
         if family not in families:
             families.add(family)
             members.append((spec, exe, note))
@@ -1457,12 +1889,25 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
     spec = dict(spec)
     if args.model and not session:
         spec["model"] = args.model
+        check_spec(cfg, spec, spec_str(spec))
+        why = provider_unavailable(cfg, spec)
+        if why:
+            raise CrewError(f"{spec_str(spec)}: {why}")
     request_text = text
     backend = spec["backend"]
     spec, effort = settle_effort(cfg, spec, args.effort or spec.get("effort") or role_cfg.get("effort"))
     top = git_top(cwd)
     agy_fetch = backend == "agy" and scope["web"] and agy_fetch_allowed(cfg)
-    enf = enforcement(backend, scope, bool(top), agy_fetch)
+    bcfg = (cfg.get("backends") or {}).get(backend) or {}
+    # agy can't run commands headless. When verify comes from the role (e.g. review falling back to
+    # Gemini Argon) rather than --access, run it read-only, as api agents do, instead of failing.
+    agy_read_only = backend == "agy" and scope["access"] == "verify" and not getattr(args, "access", None)
+    if agy_read_only:
+        scope = dict(scope, access="read")
+    enf = enforcement(backend, scope, bool(top), agy_fetch, bcfg)
+    if agy_read_only:
+        enf = dict(enf, files=enf["files"] + "; the role asks for verify, but agy cannot run commands, "
+                                              "so this runs read-only (no builds or tests)")
 
     is_review = role_cfg.get("mode") == "review" and not session
     builtin_review = is_review and backend == "codex" and not text
@@ -1479,6 +1924,16 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
     task = new_task_dir(role, args.slug or cwd.name)
     scratch = task / "scratch"
     scratch.mkdir()
+    worktree = None
+    if getattr(args, "worktree", False) and not session:
+        if not top:
+            shutil.rmtree(task, ignore_errors=True)
+            raise CrewError("--worktree needs a git repository (--cd inside one)")
+        if is_review:
+            shutil.rmtree(task, ignore_errors=True)
+            raise CrewError("--worktree doesn't apply to reviews: a new worktree holds only committed files")
+        worktree = make_worktree(top, task, cwd)
+        cwd, top = Path(worktree["cwd"]), worktree["path"]
     if builtin_review:
         sent = f"(built-in codex review of target: {args.target}; no prompt is sent)"
     elif session:
@@ -1494,18 +1949,60 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
     extra_write = [cache] if cache and scope["access"] != "read" else []
     for folder in extra_write:
         folder.mkdir(parents=True, exist_ok=True)
+    provider = spec_provider(spec)
+    pcfg = providers(cfg).get(provider) or {} if provider else {}
+    backend_env, secret_env, effort_note, api_cfg = {}, {}, None, None
     if backend == "codex":
         mode = "resume" if session else ("builtin-review" if builtin_review else "exec")
-        argv = exe + codex_args(cfg, spec, effort, scope, task, cwd, mode, args.target, session, extra_write)
+        isolation, enf["mcp"] = codex_isolation(cfg, exe)
+        argv = exe + codex_args(cfg, spec, effort, scope, task, cwd, mode, args.target, session, extra_write,
+                                isolation)
         use_stdin = not builtin_review
+        if provider and pcfg.get("key_env"):
+            secret_env[pcfg["key_env"]] = pcfg["key_env"]  # from ~/.crew/keys.json when not in the environment
     elif backend == "claude":
         argv = exe + claude_args(exe, spec, effort, scope, task, top, cwd, role_cfg, session, extra_write)
         use_stdin = True
-    else:
+        enf["mcp"] = "none (--strict-mcp-config with no servers)"
+        if provider:
+            backend_env, secret_env = claude_provider_env(cfg, spec)
+    elif backend == "agy":
         argv = exe + agy_args(spec, effort, scope, task, cwd, sent)
         use_stdin = False
+    elif backend == "opencode":
+        tail, effort_note = opencode_args(exe, spec, effort, session)
+        argv, use_stdin = exe + tail, True
+        oc_cfg = opencode_config(scope)
+        write_json(task / "opencode-config.json", oc_cfg)
+        enf["mcp"] = "denied: crew's permission rules start from '*': deny"
+        if (cli_version(exe) or (0,))[0] >= 2:
+            enf["files"] += " (on a private --standalone server, so these rules apply)"
+        # Inline config outranks the user's global and project opencode configs. 1.x also reads
+        # OPENCODE_PERMISSION; 2.x reads only the inline config (and only on a private server).
+        backend_env = {"OPENCODE_CONFIG_CONTENT": json.dumps(oc_cfg),
+                       "OPENCODE_PERMISSION": json.dumps(oc_cfg["permission"])}
+        if bcfg.get("private_db"):  # keep crew's sessions out of the user's own opencode history
+            prior = None
+            if session and getattr(args, "resume", None):
+                try:
+                    prior = read_json(Path(args.resume).expanduser() / "cmd.json").get("opencode_db")
+                except (OSError, ValueError):
+                    prior = None
+            opencode_db = prior or str(task / "opencode.db")
+            backend_env["OPENCODE_DB"] = opencode_db
+    elif backend == "api":
+        argv, use_stdin = exe + ["--dir", str(task)], False
+        api_cfg = {"provider": provider, "base_url": pcfg["base_url"], "key_env": pcfg.get("key_env"),
+                   "model": api_model(spec), "effort": effort, "effort_style": pcfg.get("effort_style"),
+                   "body": pcfg.get("body") or {}, "headers": pcfg.get("headers") or {},
+                   "quota": pcfg.get("quota"), "timeout": pcfg.get("timeout", 600),
+                   "history": str(Path(session) / "conversation.json") if session else None}
+    else:
+        tail, use_stdin = command_args(bcfg, spec, effort, scope, task, cwd, sent)
+        argv = exe + tail
 
     env = {"CREW_SCRATCH": str(scratch), NESTED_MARKER: str(task)}
+    env.update(backend_env)
     if scope["access"] != "read":
         env.update({"TMP": str(scratch), "TEMP": str(scratch), "TMPDIR": str(scratch)})
     if scope["access"] == "verify":
@@ -1520,17 +2017,30 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
             rel = Path(os.path.relpath(cwd / p, top)).as_posix()
             allowed.append(rel.rstrip("/") + "/" if p.endswith("/") else rel)
     max_minutes = args.max_minutes or role_cfg.get("max_minutes") or cfg.get("max_minutes") or 60
+    stall_minutes = getattr(args, "stall_minutes", None) or role_cfg.get("stall_minutes") or cfg.get("stall_minutes")
+    if stall_minutes and backend == "agy":
+        stall_minutes = None  # agy prints nothing until it has finished, so silence isn't a stall
+    max_cost = getattr(args, "max_cost", None) or role_cfg.get("max_cost_usd") or cfg.get("max_cost_usd")
+    if max_cost:
+        if backend == "claude" and "--max-budget-usd" in cli_help(exe):
+            argv += ["--max-budget-usd", str(max_cost)]
+            enf["cost"] = f"claude --max-budget-usd {max_cost} (checked between turns, so one turn can overshoot)"
+        else:
+            enf["cost"] = f"not enforced by {backend}: crew reports a run that cost more than ${max_cost} afterwards"
     agent_label = spec_str(dict(spec, effort=effort))
     view = args.view or cfg.get("view", "auto")
     hold = cfg.get("hold", True) if args.hold is None else args.hold
 
     cmd = {"role": role, "agent": agent_label, "backend": backend, "model": spec["model"], "effort": effort,
-           "family": model_family(spec), "caller": caller, "caller_session": caller_session(), "scope": scope,
+           "family": model_family(spec, cfg), "caller": caller, "caller_session": caller_session(), "scope": scope,
            "enforcement": enf, "cwd": str(cwd), "git_top": top, "argv": argv, "stdin": use_stdin, "env": env,
            "allowed_paths": allowed, "max_minutes": max_minutes, "resumed_from": None,
            "prior_session_cost_usd": None, "fact_check": bool(scope["web"] and cfg.get("fact_check", True)),
            "prune_scratch": bool(cfg.get("prune_scratch", True)), "cache": str(cache) if cache else None,
-           "view": view, "hold": hold, "choice_note": choice_note, "created": now_iso()}
+           "view": view, "hold": hold, "choice_note": choice_note, "created": now_iso(), "provider": provider, "quota_key": quota_key(spec),
+           "secret_env": secret_env, "api": api_cfg, "effort_note": effort_note,
+           "opencode_db": backend_env.get("OPENCODE_DB"), "worktree": worktree,
+           "stall_minutes": stall_minutes, "max_cost_usd": max_cost}
     cmd.update(extra or {})
     write_json(task / "cmd.json", cmd)
 
@@ -1546,16 +2056,44 @@ def launch_task(cfg, args, role, role_cfg, spec, exe, cwd, scope, text, caller, 
         elif not how and view == "tab":
             print("crew: no usable terminal launcher; running hidden instead (see README: Visible terminals)")
     if not how:
-        launch_hidden(runner, cwd)
+        launch_hidden(runner, task)
         how = "hidden background process"
     print(f"crew: launched {role} -> {agent_label} in {how}")
     if caller:
         print(f"crew: caller={caller}" + (f" ({choice_note})" if choice_note else ""))
+    if effort_note:
+        print(f"crew: note: {effort_note}")
     print(f"crew: scope access={scope['access']} web={on_off(scope['web'])} network={on_off(scope['network'])}")
     for dim, how_enforced in enf.items():
         print(f"crew:   {dim}: {how_enforced}")
+    if worktree:
+        print(f"crew: worktree {worktree['path']} on branch {worktree['branch']} (from HEAD: uncommitted "
+              "changes in your checkout are not in it)")
     print(f"crew: dir={task}")
     return task
+
+
+def make_worktree(top: str, task: Path, cwd: Path) -> dict:
+    """A git worktree for one run, at <run folder>/worktree on branch crew/<run name>. It starts
+    from HEAD, so parallel write tasks can't trip over each other or over your own edits."""
+    path, branch = task / "worktree", f"crew/{task.name}"
+    r = subprocess.run(["git", "-C", top, "worktree", "add", "-q", "-b", branch, str(path), "HEAD"],
+                       capture_output=True, timeout=300)
+    if r.returncode != 0:
+        shutil.rmtree(task, ignore_errors=True)
+        raise CrewError("could not create a worktree: " + r.stderr.decode("utf-8", "replace").strip())
+    rel = os.path.relpath(str(cwd), top)
+    return {"path": str(path), "branch": branch, "repo": top,
+            "cwd": str(path if rel == "." else path / rel)}
+
+
+def finish_worktree(wt: dict, touched: list) -> dict:
+    """Keep a run's worktree when the agent changed something; otherwise remove it and its branch."""
+    if touched:
+        return dict(wt, kept=True)
+    for args in (["worktree", "remove", "--force", wt["path"]], ["branch", "-D", wt["branch"]]):
+        subprocess.run(["git", "-C", wt["repo"], *args], capture_output=True, timeout=120)
+    return dict(wt, kept=False)
 
 
 def cmd_collect(args) -> int:
@@ -1652,12 +2190,13 @@ def cmd_prune(args) -> int:
 def cmd_quota(args) -> int:
     state = read_quota()
     if not state:
-        print("crew: no usage-limit data yet (claude and codex runs report it; agy does not)")
+        print("crew: no usage-limit data yet (claude and codex runs report it, and OpenRouter keys with a "
+              "credit limit; others only when they hit a limit)")
         return 0
     now = time.time()
     for backend, entry in sorted(state.items()):
         score = quota_score(entry, now)
-        line = f"{backend:<8} {'?' if score is None else f'{score:.0%} used'}"
+        line = f"{backend:<11} {'?' if score is None else f'{score:.0%} used'}"
         if (entry.get("limited_until") or 0) > now:
             line += f"  LIMITED until {dt.datetime.fromtimestamp(entry['limited_until']):%H:%M %d %b}"
         for name, w in (entry.get("windows") or {}).items():
@@ -1686,6 +2225,13 @@ def cmd_status(args) -> int:
             print(f"{d.name:<48} {str(r.get('status')):<16} {str(r.get('agent')):<32} {r.get('seconds')}s")
         else:
             state = {"alive": "running", "dead": "dead (runner gone, no result)"}.get(runner_state(d), "starting?")
+            if state == "running":
+                try:
+                    quiet = time.time() - float(read_json(d / "run.json").get("last_output"))
+                    if quiet >= 60:
+                        state += f", no output for {quiet / 60:.0f} min"
+                except (OSError, ValueError, TypeError):
+                    pass
             print(f"{d.name:<48} {state}")
     return 0
 
@@ -1727,8 +2273,9 @@ def cmd_stats(args) -> int:
     for name, g in sorted(groups.items()):
         cost = f"{g['cost']:.2f}{'?' if g['guess'] else ''}" if g["cost"] else "-"
         print(f"{name:<40} {g['tasks']:>5} {g['ok']:>4} {g['sec'] / 60:>8.1f} {g['tokens']:>12} {cost:>9}")
-    print("\ncost is the API list price the CLI reports (claude only; codex and agy report none). "
-          "On a subscription it measures usage, not money. '?' = the CLI had no price for that model.")
+    print("\ncost is the price the agent or provider reports (claude, opencode, and api providers that "
+          "report it, e.g. OpenRouter; codex and agy report none). On a subscription it measures usage, not money. "
+          "'?' = the CLI had no price for that model.")
     return 0
 
 
@@ -1779,6 +2326,12 @@ def catalogue_rows(cfg: dict) -> list:
 
 def cmd_models(args) -> int:
     cfg = load_config()
+    if getattr(args, "changes", False):
+        return model_changes(cfg)
+    if getattr(args, "provider", None):
+        for model in provider_models(cfg, args.provider):
+            print(f"api:{args.provider}/{model}")
+        return 0
     print("Models crew knows by name. Use one as --agent <name>[@effort], e.g. --agent gemini-flash@medium,")
     print("or --agent \"gemini flash\" --effort medium. * marks the default effort.\n")
     rows = catalogue_rows(cfg)
@@ -1801,7 +2354,7 @@ def cmd_models(args) -> int:
     am = agy_models(cfg) if backend_cmd(cfg, "agy") else None
     if am is not None:
         offered["agy"] = {m["slug"] for m in am}
-    for backend in BACKENDS:
+    for backend in ("codex", "claude", "agy"):
         if not backend_cmd(cfg, backend):
             print(f"  {backend}: not installed, so its models above can't be used")
             continue
@@ -1828,6 +2381,20 @@ def cmd_models(args) -> int:
         extra = sorted(m for m in have if m and m not in known)
         print(f"  {backend}: installed; offers {len(have)} model id(s)"
               + (f"; not in the list above (use {backend}:<id>): {', '.join(extra)}" if extra else ""))
+    print("\nopencode (from `opencode models`; connect providers with `opencode auth login`):")
+    om = opencode_models(cfg)
+    if om is None:
+        print("  (opencode not installed or not responding)")
+    elif not om:
+        print("  (no models: connect a provider first)")
+    for m in om or []:
+        print(f"  opencode:{m}")
+    print("\nproviders (api:<provider>/<model>, claude+<provider>:<model>, codex+<provider>:<model>;\n"
+          "  `crew.py models --provider <name>` lists a provider's models):")
+    for name, pcfg in providers(cfg).items():
+        print(f"  {name:<12} {provider_status(cfg, name, pcfg)}")
+    for name in known_backends(cfg)[len(BACKENDS):]:
+        print(f"\n{name} (command-line agent defined in your config): {'installed' if backend_cmd(cfg, name) else 'NOT INSTALLED'}")
     return 0
 
 
@@ -1907,7 +2474,9 @@ def cmd_doctor(args) -> int:
     if os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED"):
         report(None, "sandbox", "running inside codex's sandbox: crew needs to run outside it "
                "(write ~/.crew, start agents that use the network). Approve running it unsandboxed.")
-    for backend in BACKENDS:
+    for backend in known_backends(cfg):
+        if backend == "api":
+            continue
         cmd = backend_cmd(cfg, backend)
         if not cmd:
             report(None, backend, "not installed (roles that use it will fall back or fail)")
@@ -1968,6 +2537,28 @@ def cmd_doctor(args) -> int:
                 for spec in expand_agent(cfg, r.get("agent")):
                     if spec["backend"] == "agy" and known and spec["model"] not in known:
                         report(None, f"role {name}", f"model {spec['model']} is not in `agy models`")
+        if backend == "opencode":
+            run_help = cli_help(cmd + ["run"])
+            report(True if "--format" in run_help else None, "opencode run --format json",
+                   "supported" if "--format" in run_help else "not found in `opencode run --help`; update opencode")
+            known = set(opencode_models(cfg) or [])
+            report(True if known else None, "opencode models",
+                   f"{len(known)} available" if known else "none listed: connect a provider with `opencode auth login`")
+            for name, r in (cfg.get("roles") or {}).items():
+                for spec in expand_agent(cfg, r.get("agent")):
+                    if spec["backend"] == "opencode" and known and spec["model"] not in known:
+                        report(None, f"role {name}", f"model {spec['model']} is not in `opencode models`")
+    refs = list((cfg.get("agents") or {}).values()) + [r.get("agent") for r in (cfg.get("roles") or {}).values()]
+    used = {spec_provider(spec) for ref in refs for spec in _safe_expand(cfg, ref) if spec["backend"] != "opencode"}
+    unset = []
+    for name, pcfg in providers(cfg).items():
+        status = provider_status(cfg, name, pcfg)
+        if status.startswith("no key (") and name not in used:
+            unset.append(name)
+            continue
+        report(None if status.startswith("no key (") else True, f"provider {name}", status)
+    if unset:
+        report(True, "providers without a key", f"{', '.join(unset)} (add one with `crew.py set-key <provider>`)")
     for name, r in (cfg.get("roles") or {}).items():
         d = describe_agent(cfg, r.get("agent"), caller)
         report(False if d.startswith(("INVALID", "NOT")) else True, f"role {name}", d)
@@ -1987,8 +2578,111 @@ def cmd_doctor(args) -> int:
                ("this process runs in Windows session 0 (service/remote), so no window can open; tasks run hidden"
                 if IS_WIN and windows_service_session() else
                 "none found; tasks run hidden (set \"terminal\" in config, see README)"))
+    if getattr(args, "ask", False):
+        problems += ask_agents(cfg)
     print(f"\nconfig: {USER_CONFIG}{'' if USER_CONFIG.exists() else ' (not created; built-in defaults in use)'}")
     return 1 if problems else 0
+
+
+def _safe_expand(cfg: dict, ref) -> list:
+    try:
+        return expand_agent(cfg, ref)
+    except CrewError:
+        return []
+
+
+def ask_agents(cfg: dict) -> int:
+    """Send every distinct, usable agent in the roles and aliases a one-word question, in parallel,
+    through crew's normal run path. Returns the number that failed."""
+    refs = [r.get("agent") for r in (cfg.get("roles") or {}).values()] + list((cfg.get("agents") or {}).values())
+    specs = {}
+    for ref in refs:
+        for spec in _safe_expand(cfg, ref):
+            if backend_cmd(cfg, spec["backend"]) and not provider_unavailable(cfg, spec):
+                specs.setdefault(spec_str(spec), spec)
+    roles = cfg.get("roles") or {}
+    role = "light" if "light" in roles else next(iter(roles), None)
+    if not specs or not role:
+        print("crew: no usable agents to ask")
+        return 0
+    probe_dir = CREW_HOME / "doctor"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nAsking {len(specs)} agent(s) a one-word question (this uses a little of each one's quota)...")
+
+    def ask(label):
+        argv = [sys.executable, str(Path(__file__).resolve()), "run", "--role", role, "--agent", label,
+                "--caller", "none", "--access", "read", "--no-web", "--no-network", "--view", "hidden",
+                "--no-hold", "--max-minutes", "5", "--timeout", "420", "--slug", "doctor-ask",
+                "--cd", str(probe_dir), "--wait", "--task", "Reply with the single word OK and nothing else."]
+        try:
+            r = subprocess.run(argv, capture_output=True, timeout=480)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return label, False, str(e)
+        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        status = re.search(r"^crew: (\S+) \|", out, re.M)
+        answer = out.split("----- final answer -----", 1)[-1].strip() if "----- final answer -----" in out else ""
+        if r.returncode == 0:
+            return label, True, f"answered {short(answer, 40)!r}"
+        why = status[1] if status else short(out.strip().splitlines()[-1] if out.strip() else "no output", 160)
+        return label, False, why
+
+    failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for label, ok, detail in pool.map(ask, sorted(specs)):
+            failed += not ok
+            print(f"[{'ok  ' if ok else 'FAIL'}] ask {label}: {detail}")
+    return failed
+
+
+MODELS_SEEN = CREW_HOME / "models-seen.json"
+
+
+def current_model_lists(cfg: dict) -> dict:
+    """Model ids per source, from local catalogues and the providers you have keys for."""
+    lists = {}
+    cm = codex_models()
+    if cm is not None:
+        lists["codex"] = sorted(str(m.get("slug")) for m in cm if m.get("slug"))
+    am = agy_models(cfg)
+    if am is not None:
+        lists["agy"] = sorted(m["slug"] for m in am)
+    om = opencode_models(cfg)
+    if om:
+        lists["opencode"] = sorted(om)
+    for name, pcfg in providers(cfg).items():
+        if not pcfg.get("base_url") or (pcfg.get("key_env") and not read_secret(pcfg["key_env"])):
+            continue
+        try:
+            lists[f"provider:{name}"] = provider_models(cfg, name)
+        except CrewError:
+            continue  # a local server that isn't running, or a provider without a model list
+    return lists
+
+
+def model_changes(cfg: dict) -> int:
+    try:
+        seen = read_json(MODELS_SEEN)
+    except (OSError, ValueError):
+        seen = {}
+    lists = current_model_lists(cfg)
+    if not seen:
+        print(f"crew: recorded {sum(map(len, lists.values()))} models from {', '.join(lists) or 'no sources'}; "
+              "later runs of `crew.py models --changes` report what was added or removed")
+    changed = False
+    for source, models in lists.items():
+        if source not in seen:
+            if seen:
+                changed = True
+                print(f"{source}: new source, {len(models)} models")
+            continue
+        for sign, diff in (("+", set(models) - set(seen[source])), ("-", set(seen[source]) - set(models))):
+            for m in sorted(diff):
+                changed = True
+                print(f"{source}: {sign} {m}")
+    if seen and not changed:
+        print("crew: no model changes since the last check")
+    write_json(MODELS_SEEN, dict(seen, **lists))
+    return 0
 
 
 def cmd_setup_agy_web(args) -> int:
@@ -2011,6 +2705,84 @@ def cmd_setup_agy_web(args) -> int:
     print(f"crew: added {AGY_FETCH_RULE} to permissions.allow in {path}")
     print("crew: agy may now read any web page without asking. Remove the rule to undo.")
     return 0
+
+
+def cmd_set_key(args) -> int:
+    """Store or remove an API key in ~/.crew/keys.json (owner-only permissions). Keys in the
+    environment take precedence; the file is for tabs that don't inherit your shell's variables."""
+    cfg = load_config()
+    pcfg = providers(cfg).get(args.name)
+    var = (pcfg or {}).get("key_env") if pcfg else args.name
+    if pcfg and not var:
+        raise CrewError(f"provider {args.name} needs no key")
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", var or ""):
+        raise CrewError(f"'{args.name}' is neither a provider nor a variable name")
+    keys = read_keys()
+    if args.remove:
+        keys.pop(var, None)
+    else:
+        if sys.stdin.isatty():
+            import getpass
+            value = getpass.getpass(f"{var}: ").strip()
+        else:
+            value = sys.stdin.readline().strip()
+        if not value:
+            raise CrewError("no key given")
+        keys[var] = value
+    KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    write_json(KEYS_FILE, keys)
+    try:
+        os.chmod(KEYS_FILE, 0o600)
+    except OSError:
+        pass
+    print(f"crew: {var} {'removed from' if args.remove else 'saved in'} {KEYS_FILE}")
+    return 0
+
+
+def opencode_models(cfg: dict):
+    """`provider/model` ids from `opencode models`, or None if opencode isn't installed or fails."""
+    cmd = backend_cmd(cfg, "opencode")
+    if not cmd:
+        return None
+    try:
+        r = subprocess.run(cmd + ["models"], capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = strip_ansi(r.stdout.decode("utf-8", "replace"))
+    return [line.strip() for line in out.splitlines() if re.match(r"^[\w.@~-]+/\S+$", line.strip())]
+
+
+def provider_models(cfg: dict, name: str) -> list:
+    """Model ids from a provider's GET /models."""
+    pcfg = providers(cfg).get(name)
+    if pcfg is None:
+        raise CrewError(f"Unknown provider '{name}' (known: {', '.join(providers(cfg))})")
+    if not pcfg.get("base_url"):
+        raise CrewError(f"provider {name} has no base_url to list models from")
+    headers = {"User-Agent": "crew"}
+    headers.update(pcfg.get("headers") or {})
+    if pcfg.get("key_env"):
+        key = read_secret(pcfg["key_env"])
+        if not key:
+            raise CrewError(f"no API key for {name}: set {pcfg['key_env']} or run `crew.py set-key {name}`")
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(pcfg["base_url"].rstrip("/") + "/models", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise CrewError(f"could not list {name} models: {e}")
+    items = data.get("data") if isinstance(data, dict) else data
+    return sorted(str(m.get("id")) for m in items or [] if isinstance(m, dict) and m.get("id"))
+
+
+def provider_status(cfg: dict, name: str, pcfg: dict) -> str:
+    uses = (["api"] if pcfg.get("base_url") else []) + (["claude+"] if pcfg.get("anthropic_url") else []) + (["codex+"] if pcfg.get("responses") else [])
+    if pcfg.get("key_env"):
+        key = "key set" if read_secret(pcfg["key_env"]) else f"no key ({pcfg['key_env']})"
+    else:
+        key = "no key needed"
+    return f"{key}; usable by {', '.join(uses)}"
 
 
 # ---------------------------------------------------------------- fact check
@@ -2479,6 +3251,9 @@ def enable_vt() -> None:
         pass
 
 
+LAST_OUTPUT = [time.time()]  # when the agent last printed anything; the heartbeat reports it
+
+
 class View:
     """Shows agent output live and keeps a compact copy in raw.log. Plain-text agents (agy)."""
 
@@ -2497,6 +3272,7 @@ class View:
         self.quota = None  # usage-limit windows the backend reported, if it reports them
 
     def show(self, text: str, style=None) -> None:
+        LAST_OUTPUT[0] = time.time()
         out = f"\x1b[{COLOURS[style]}m{text}\x1b[0m" if style and self.colour else text
         print(out, flush=True)
         if self.raw.closed:  # crew's own notes after the agent has finished still belong in the log
@@ -2528,6 +3304,7 @@ class JsonView(View):
         self.last_message = None
 
     def feed(self, line: str) -> None:
+        LAST_OUTPUT[0] = time.time()  # an event the view doesn't display still shows the agent is working
         self.events.write(line if line.endswith("\n") else line + "\n")
         self.events.flush()
         s = line.strip()
@@ -2687,6 +3464,100 @@ class ClaudeView(JsonView):
             self.show(f"tokens: {self.tokens}  cost: {cost}" +(f"  denied: {', '.join(self.denied)}" if self.denied else ""), "dim")
 
 
+class OpencodeView(JsonView):
+    """Renders `opencode run --format json`: one line per tool call, text in full. Events carry a
+    sessionID and a `part`; step_finish parts carry tokens and cost for that step."""
+
+    TOOL_ARG = ("command", "filePath", "file_path", "pattern", "query", "url", "path")
+    DENIED_RE = re.compile(r"permission|denied|not allowed|rejected", re.IGNORECASE)
+
+    def __init__(self, task: Path):
+        super().__init__(task)
+        self.since_tool = []  # text parts after the last tool call: the final answer
+        self.all_parts = []
+        self.cost = None
+
+    def event(self, e: dict) -> None:
+        self.session = e.get("sessionID") or e.get("sessionId") or self.session
+        part = e.get("part") if isinstance(e.get("part"), dict) else {}
+        kind = e.get("type") or part.get("type")
+        if kind == "text":
+            text = part.get("text") or e.get("text") or ""
+            if text.strip():
+                self.since_tool.append(text)
+                self.all_parts.append(text)
+                self.last_message = "\n\n".join(self.since_tool)
+                self.show("")
+                self.show(text)
+        elif kind in ("tool_use", "tool"):
+            self.since_tool = []
+            tool = part.get("tool") or e.get("tool") or "tool"
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            args = state.get("input") if isinstance(state.get("input"), dict) else {}
+            key = next((k for k in self.TOOL_ARG if k in args), None)
+            detail = args[key] if key else (json.dumps(args, ensure_ascii=False) if args else "")
+            self.show(f"{tool}: {short(detail, 170)}", "cyan")
+            if state.get("status") == "error":
+                err = str(state.get("error") or "")
+                self.show("  -> error: " + short(err, 160), "yellow")
+                if self.DENIED_RE.search(err) and tool not in self.denied:
+                    self.denied.append(tool)
+        elif kind in ("step_finish", "step-finish"):
+            tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+            step = sum(int(_num(tokens.get(k)) or 0) for k in ("input", "output", "reasoning"))
+            step += int(_num(cache.get("write")) or 0)
+            self.tokens = (self.tokens or 0) + step or self.tokens
+            cost = _num(part.get("cost"))
+            if cost is not None:
+                self.cost = (self.cost or 0.0) + cost
+        elif kind == "error":
+            err = e.get("error") if isinstance(e.get("error"), dict) else {}
+            data = err.get("data") if isinstance(err.get("data"), dict) else {}
+            self.error = str(data.get("message") or err.get("message") or err.get("name") or e.get("message")
+                             or "opencode reported an error")
+            self.show(f"ERROR: {self.error}", "red")
+        mid = part.get("modelID") or e.get("modelID")
+        if mid:
+            pid = part.get("providerID") or e.get("providerID")
+            self.resolved_model = f"{pid}/{mid}" if pid else mid
+
+    def final_text(self) -> str:
+        return (self.last_message or "\n\n".join(self.all_parts)).strip()
+
+    def close(self) -> None:
+        if self.tokens or self.cost is not None:
+            cost = f"${self.cost:.4f}" if isinstance(self.cost, (int, float)) else "n/a"
+            self.show(f"tokens: {self.tokens}  cost: {cost}" + (f"  denied: {', '.join(self.denied)}"
+                                                                if self.denied else ""), "dim")
+        super().close()
+
+
+class ApiView(JsonView):
+    """Renders crew's own `_api` runner: text lines as they stream, then usage and cost."""
+
+    def event(self, e: dict) -> None:
+        kind = e.get("type")
+        if kind == "start":
+            self.session = e.get("session") or self.session
+            self.show(f"{e.get('provider')} {e.get('url')}  model {e.get('model')}", "dim")
+        elif kind == "text":
+            self.show(e.get("text", ""))
+        elif kind == "note":
+            self.show("crew: " + str(e.get("text", "")), "yellow")
+        elif kind == "done":
+            self.last_message = e.get("text") or ""
+            self.session = e.get("session") or self.session
+            self.resolved_model = e.get("model") or self.resolved_model
+            self.tokens = e.get("tokens")
+            self.cost = _num(e.get("cost"))
+            cost = f"${self.cost:.4f}" if self.cost is not None else "n/a"
+            self.show(f"tokens: {self.tokens}  cost: {cost}", "dim")
+        elif kind == "error":
+            self.error = str(e.get("message") or "the API request failed")
+            self.show(f"ERROR: {self.error}", "red")
+
+
 def kill_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
@@ -2708,6 +3579,7 @@ def heartbeat(task: Path, stop: threading.Event) -> None:
     info = {"pid": os.getpid(), "started": now_iso()}
     while True:
         info["beat"] = time.time()
+        info["last_output"] = LAST_OUTPUT[0]
         try:
             write_json(task / "run.json", info)
         except OSError:
@@ -2766,6 +3638,140 @@ def cmd_runner(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ api runner
+
+def _emit(event: dict) -> None:
+    print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def api_body(api: dict, messages: list, minimal: bool = False) -> dict:
+    """Chat-completions request. `minimal` drops everything optional, for providers that reject it."""
+    body = {"model": api["model"], "messages": messages, "stream": True}
+    if minimal:
+        return body
+    body["stream_options"] = {"include_usage": True}
+    effort, style = api.get("effort"), api.get("effort_style")
+    if effort and style == "openai":
+        body["reasoning_effort"] = effort
+    elif effort and style == "openrouter":
+        body["reasoning"] = {"effort": effort}
+    body.update(api.get("body") or {})
+    return body
+
+
+def api_stream(url: str, headers: dict, body: dict, timeout: float):
+    """POST a streaming chat completion; yields parsed SSE data objects."""
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ctype = resp.headers.get("Content-Type", "")
+        if "text/event-stream" not in ctype:  # a provider that ignored stream=true
+            yield json.loads(resp.read().decode("utf-8", "replace"))
+            return
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                return
+            try:
+                yield json.loads(data)
+            except ValueError:
+                continue
+
+
+def cmd_api(args) -> int:
+    """Internal: run one api task. Reads cmd.json, streams the answer as JSON lines for ApiView,
+    and keeps the conversation (conversation.json) so --resume can continue it."""
+    task = Path(args.dir)
+    cmd = read_json(task / "cmd.json")
+    api = cmd["api"]
+    url = api["base_url"].rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "User-Agent": "crew"}
+    headers.update(api.get("headers") or {})
+    if api.get("key_env"):
+        key = read_secret(api["key_env"])
+        if not key:
+            _emit({"type": "error", "message": f"no API key: set {api['key_env']} or run "
+                                               f"`crew.py set-key {api['provider']}`"})
+            return 1
+        headers["Authorization"] = f"Bearer {key}"
+    messages = []
+    if api.get("history"):
+        try:
+            messages = list(read_json(Path(api["history"])))
+        except (OSError, ValueError, TypeError):
+            _emit({"type": "error", "message": f"cannot read the earlier conversation {api['history']}"})
+            return 1
+    messages.append({"role": "user", "content": (task / "task.md").read_text(encoding="utf-8")})
+    _emit({"type": "start", "provider": api["provider"], "url": url, "model": api["model"], "session": str(task)})
+
+    text, line, usage, model, cost = [], "", None, None, None
+    for attempt in ("full", "minimal"):
+        try:
+            for obj in api_stream(url, headers, api_body(api, messages, attempt == "minimal"),
+                                  float(api.get("timeout") or 600)):
+                if isinstance(obj.get("error"), dict) or isinstance(obj.get("error"), str):
+                    err = obj["error"]
+                    msg = err.get("message") if isinstance(err, dict) else err
+                    code = err.get("code") if isinstance(err, dict) else None
+                    _emit({"type": "error", "message": f"{code or 'error'}: {msg}"})
+                    return 1
+                model = obj.get("model") or model
+                usage = obj.get("usage") or usage
+                for choice in obj.get("choices") or []:
+                    delta = choice.get("delta") or choice.get("message") or {}
+                    piece = delta.get("content")
+                    if not isinstance(piece, str) or not piece:
+                        continue
+                    text.append(piece)
+                    line += piece
+                    while "\n" in line:
+                        done, line = line.split("\n", 1)
+                        _emit({"type": "text", "text": done})
+            break
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:600]
+            if e.code in (400, 422) and attempt == "full" and not text:
+                _emit({"type": "note", "text": f"HTTP {e.code} with optional fields; retrying a minimal request"})
+                continue
+            _emit({"type": "error", "message": f"HTTP {e.code} {e.reason}: {short(detail, 500)}"})
+            return 1
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            _emit({"type": "error", "message": f"request to {url} failed: {e}"})
+            return 1
+    if line:
+        _emit({"type": "text", "text": line})
+    answer = "".join(text).strip()
+    tokens = None
+    if isinstance(usage, dict):
+        tokens = int(_num(usage.get("total_tokens")) or
+                     (_num(usage.get("prompt_tokens")) or 0) + (_num(usage.get("completion_tokens")) or 0)) or None
+        cost = _num(usage.get("cost"))
+    if answer:
+        (task / "final.md").write_text(answer + "\n", encoding="utf-8")
+        write_json(task / "conversation.json", messages + [{"role": "assistant", "content": answer}])
+    _emit({"type": "done", "text": answer, "model": f"{api['provider']}/{model}" if model else None,
+           "tokens": tokens, "cost": cost, "session": str(task)})
+    return 0
+
+
+def openrouter_credit(key_env: str):
+    """Credit left on an OpenRouter key with a spending cap, as a usage window; None without a cap.
+    GET /api/v1/key reports limit and limit_remaining."""
+    key = read_secret(key_env)
+    if not key:
+        return None
+    req = urllib.request.Request("https://openrouter.ai/api/v1/key",
+                                 headers={"Authorization": f"Bearer {key}", "User-Agent": "crew"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = (json.loads(resp.read().decode("utf-8", "replace")) or {}).get("data") or {}
+    limit, remaining = _num(data.get("limit")), _num(data.get("limit_remaining"))
+    if not limit or remaining is None:
+        return None
+    return {"credit": {"used": min(max(1 - remaining / limit, 0.0), 1.0), "resets_at": None}}
+
+
 # Per-session variables the calling agent sets for its own commands (session ids, messaging
 # sockets and tokens, effort). Passed on, they would make a delegated agent think it belongs to
 # the caller's session, and would hand the caller's tokens to another vendor's process.
@@ -2780,13 +3786,20 @@ def after_run(task: Path, cmd: dict, view, status: str, note):
     """crew's own steps once the agent has finished: record quota, handle a usage limit (and
     retry elsewhere), fact-check web answers. A failure here is noted, never fatal to the run."""
     backend = cmd["backend"]
+    key = cmd.get("quota_key") or backend  # the provider, when the run used one
     quota = retried_as = checks = None
     try:
         quota = view.quota
-        if backend == "codex" and view.session:
+        if backend == "codex" and view.session and not cmd.get("provider"):
             quota = codex_quota_windows(view.session)
+        if cmd.get("provider") == "openrouter":
+            try:
+                pcfg = providers(load_config()).get("openrouter") or {}
+                quota = openrouter_credit(pcfg.get("key_env") or "OPENROUTER_API_KEY") or quota
+            except (OSError, ValueError, AttributeError):
+                pass  # the credit check is advisory
         if quota:
-            record_quota(backend, quota, f"{backend} run {task.name}")
+            record_quota(key, quota, f"{backend} run {task.name}")
         tail = "\n".join([view.error or ""] + view.text[-30:])
         hit_limit = any((_num((w or {}).get("used")) or 0) >= 1 for w in (quota or {}).values())
         if status in ("agent-error", "empty") and (looks_rate_limited(tail) or hit_limit):
@@ -2794,8 +3807,8 @@ def after_run(task: Path, cmd: dict, view, status: str, note):
             resets = limit_reset_from_text(tail) or max(
                 [_num(w.get("resets_at")) for w in (quota or {}).values()
                  if (_num((w or {}).get("used")) or 0) >= 1 and _num(w.get("resets_at"))], default=None)
-            record_limit(backend, resets, load_config().get("limit_cooldown_minutes", 60))
-            note = f"{backend} hit its usage limit" + (f" (resets {dt.datetime.fromtimestamp(resets):%H:%M %d %b})"
+            record_limit(key, resets, load_config().get("limit_cooldown_minutes", 60))
+            note = f"{key} hit its usage limit" + (f" (resets {dt.datetime.fromtimestamp(resets):%H:%M %d %b})"
                                                        if resets else "") + (f": {note}" if note else "")
             req = cmd.get("request") or {}
             if req.get("retry"):
@@ -2833,18 +3846,29 @@ def retry_elsewhere(task: Path):
 
 def agent_env(cmd: dict) -> dict:
     env = {k: v for k, v in os.environ.items() if not SESSION_VAR_RE.match(k.upper())}
-    env.update(cmd.get("env") or {})
+    for key, value in (cmd.get("env") or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    for var, source in (cmd.get("secret_env") or {}).items():  # API keys, never stored in cmd.json
+        value = read_secret(source)
+        if value:
+            env[var] = value
     return env
 
 
 def run_agent(task: Path, cmd: dict, started: float) -> None:
     text = (task / "task.md").read_text(encoding="utf-8")
-    view = {"codex": CodexView, "claude": ClaudeView}.get(cmd["backend"], View)(task)
+    view = {"codex": CodexView, "claude": ClaudeView, "opencode": OpencodeView,
+            "api": ApiView}.get(cmd["backend"], View)(task)
     print_header(cmd, text, task, view)
     top = cmd.get("git_top")
     before = git_state(top) if top else None
     popen_kw = {} if IS_WIN else {"start_new_session": True}
-    proc = subprocess.Popen(cmd["argv"], cwd=cmd["cwd"], env=agent_env(cmd),
+    env = agent_env(cmd)
+    env["PWD"] = cmd["cwd"]  # some CLIs (opencode) take their project folder from PWD, not the process cwd
+    proc = subprocess.Popen(cmd["argv"], cwd=cmd["cwd"], env=env,
                             stdin=subprocess.PIPE if cmd["stdin"] else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **popen_kw)
     if cmd["stdin"]:
@@ -2855,7 +3879,7 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
             except (BrokenPipeError, OSError):
                 pass
         threading.Thread(target=feed, daemon=True).start()
-    timed_out = threading.Event()
+    timed_out, stalled = threading.Event(), threading.Event()
 
     def on_timeout():
         timed_out.set()
@@ -2872,6 +3896,17 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
                 kill_tree(proc)
                 return
     threading.Thread(target=watch_stop, daemon=True).start()
+    LAST_OUTPUT[0] = time.time()
+    if cmd.get("stall_minutes"):
+        def watch_stall():
+            limit = float(cmd["stall_minutes"]) * 60
+            while proc.poll() is None:
+                if time.time() - LAST_OUTPUT[0] > limit:
+                    stalled.set()
+                    kill_tree(proc)
+                    return
+                time.sleep(min(5.0, limit / 4))
+        threading.Thread(target=watch_stall, daemon=True).start()
     try:
         for raw in proc.stdout:
             view.feed(raw.decode("utf-8", "replace"))
@@ -2904,6 +3939,8 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
     note = None
     if cancelled.is_set():
         status, note = "cancelled", "stopped with `crew.py stop`"
+    elif stalled.is_set():
+        status, note = "stalled", f"killed after no output for stall_minutes={cmd.get('stall_minutes')}"
     elif timed_out.is_set():
         status, note = "timeout", f"killed after max_minutes={cmd.get('max_minutes')}"
     elif rc != 0 or view.error:
@@ -2943,6 +3980,15 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
     if isinstance(session_cost, (int, float)) and isinstance(cmd.get("prior_session_cost_usd"), (int, float)):
         cost = max(session_cost - cmd["prior_session_cost_usd"], 0.0)
     resolved = view.resolved_model or cmd["model"]
+    cap = _num(cmd.get("max_cost_usd"))
+    if cap is not None and isinstance(cost, (int, float)) and cost > cap:
+        over = f"cost ${cost:.4f} is over max_cost_usd ${cap}"
+        note = f"{note}; {over}" if note else over
+    worktree = finish_worktree(cmd["worktree"], touched) if cmd.get("worktree") else None
+    if worktree:
+        wt_note = (f"changes are in worktree {worktree['path']} on branch {worktree['branch']}" if worktree["kept"]
+                   else "the worktree had no changes and was removed")
+        note = f"{note}; {wt_note}" if note else wt_note
     result = {"status": status, "note": note, "exit": rc, "role": cmd["role"], "agent": cmd["agent"],
               "backend": cmd["backend"], "model": cmd["model"], "resolved_model": resolved,
               "scope": cmd["scope"], "seconds": seconds, "tokens": view.tokens, "cost_usd": cost,
@@ -2951,6 +3997,7 @@ def run_agent(task: Path, cmd: dict, started: float) -> None:
               "concurrent_changes": concurrent, "concurrent_running": running if violations else [],
               "base_status": base_status if violations else None, "base_note": base_note if violations else None,
               "denied_tools": view.denied, "quota": quota, "checks": checks, "retried_as": retried_as,
+              "worktree": worktree,
               "final": str(final), "finished": now_iso()}
     write_json(task / "result.json", result)
     append_line(LEDGER, json.dumps({
@@ -2980,16 +4027,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="crew.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
-    callers = BACKENDS + ("none",)
 
     r = sub.add_parser("run", help="dispatch a task")
     r.add_argument("--role", help="role from the config (review, check, implement, ...)")
     r.add_argument("--task", help="what the agent should do, inline")
     r.add_argument("--task-file", help="what the agent should do, from a file")
     r.add_argument("--cd", default=os.getcwd(), help="working directory for the agent (default: here)")
-    r.add_argument("--caller", choices=callers,
-                   help="the agent running crew; its own vendor is skipped in fallback lists (default: detected)")
-    r.add_argument("--agent", help="use this agent: an alias or backend:model[@effort]")
+    r.add_argument("--caller", type=caller_arg,
+                   help="the agent running crew (codex | claude | agy | opencode:<provider/model> | none); its own "
+                        "model family is skipped in fallback lists (default: detected)")
+    r.add_argument("--agent", help="use this agent: an alias or backend[+provider]:model[@effort]")
     r.add_argument("--model", help="override just the model name")
     r.add_argument("--effort", help="override reasoning effort (low | medium | high | ...)")
     r.add_argument("--access", choices=ACCESS_LEVELS, help="files: read | verify (build/test, scratch writes) | write")
@@ -2997,12 +4044,18 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--network", action=argparse.BooleanOptionalAction, default=None,
                    help="allow network for commands the agent runs (codex/claude, verify/write only)")
     r.add_argument("--target", default="uncommitted", help="review target: uncommitted | commit:<sha> | base:<branch>")
-    r.add_argument("--resume", help="follow up on a finished codex or claude task in the same session")
+    r.add_argument("--resume", help="follow up on a finished codex, claude, opencode or api task in the same session")
     r.add_argument("--slug", help="short name for the task directory")
     r.add_argument("--view", choices=("auto", "tab", "hidden"), help="visible terminal or hidden (default from config)")
     r.add_argument("--hold", action=argparse.BooleanOptionalAction, default=None,
                    help="keep the terminal tab open after the task ends")
     r.add_argument("--max-minutes", type=float, help="kill the agent after this long")
+    r.add_argument("--stall-minutes", type=float,
+                   help="kill the agent if it prints nothing for this long (not for agy, which prints only at the end)")
+    r.add_argument("--max-cost", type=float, metavar="USD",
+                   help="cost cap: enforced by claude (--max-budget-usd); other agents are flagged afterwards")
+    r.add_argument("--worktree", action="store_true",
+                   help="run in a new git worktree from HEAD (kept with its branch if the agent changed files)")
     r.add_argument("--wait", action="store_true", help="block until done, then print the final answer")
     r.add_argument("--brief", action="store_true",
                    help=f"with --wait, print only the first {BRIEF_LINES} lines of the answer and its path")
@@ -3038,15 +4091,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stats", help="usage per backend and model").set_defaults(func=cmd_stats)
     ro = sub.add_parser("roles", help="show roles, aliases and which agent each resolves to")
-    ro.add_argument("--caller", choices=callers)
+    ro.add_argument("--caller", type=caller_arg)
     ro.set_defaults(func=cmd_roles)
-    mo = sub.add_parser("models", help="models by name, their efforts, and which ones your CLIs offer")
+    mo = sub.add_parser("models", help="models by name, their efforts, and which ones your CLIs and providers offer")
     mo.add_argument("--offline", action="store_true", help="only print crew's list; don't ask the CLIs")
+    mo.add_argument("--provider", help="list the models a provider's API offers (needs its key)")
+    mo.add_argument("--changes", action="store_true",
+                    help="show models added or removed since the last --changes run, then remember the current lists")
     mo.set_defaults(func=cmd_models)
 
     sr = sub.add_parser("set-role", help="choose the agent and default scope for a role (saved in your config)")
     sr.add_argument("role")
-    sr.add_argument("--agent", nargs="+", help="alias or backend:model[@effort]; several = fallback list")
+    sr.add_argument("--agent", nargs="+", help="alias or backend[+provider]:model[@effort]; several = fallback list")
     sr.add_argument("--access", choices=ACCESS_LEVELS)
     sr.add_argument("--web", action=argparse.BooleanOptionalAction, default=None)
     sr.add_argument("--network", action=argparse.BooleanOptionalAction, default=None)
@@ -3061,9 +4117,21 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("--remove", action="store_true")
     sa.set_defaults(func=cmd_set_agent)
 
-    sub.add_parser("doctor", help="check installation, logins, models and permissions").set_defaults(func=cmd_doctor)
+    dr = sub.add_parser("doctor", help="check installation, logins, models and permissions")
+    dr.add_argument("--ask", action="store_true",
+                    help="also send every configured agent a one-word question, to prove it is signed in and answering")
+    dr.set_defaults(func=cmd_doctor)
     sub.add_parser("setup-agy-web", help=f"add {AGY_FETCH_RULE} to agy's settings (backs the file up first)"
                    ).set_defaults(func=cmd_setup_agy_web)
+
+    sk = sub.add_parser("set-key", help="store a provider's API key in ~/.crew/keys.json (read from stdin or a prompt)")
+    sk.add_argument("name", help="provider name (e.g. openrouter) or the key's variable (e.g. OPENROUTER_API_KEY)")
+    sk.add_argument("--remove", action="store_true")
+    sk.set_defaults(func=cmd_set_key)
+
+    ap = sub.add_parser("_api")  # internal: the api backend's request runner
+    ap.add_argument("--dir", required=True)
+    ap.set_defaults(func=cmd_api)
 
     rr = sub.add_parser("_run")  # internal: the per-task runner
     rr.add_argument("--dir", required=True)

@@ -29,6 +29,12 @@ class Naming(unittest.TestCase):
             "Gemini Flash low effort": "agy:gemini-3.8-flash-low",
             "flash": "agy:gemini-3.8-flash-medium",
             "argon": "agy:gemini-4-argon-medium",
+            "hydrogen": "agy:gemini-4-hydrogen-medium",
+            "gemini": "agy:gemini-4-hydrogen-medium",
+            "hydrogen@xhigh": "agy:gemini-4-hydrogen-xhigh",
+            "gemini hydrogen low": "agy:gemini-4-hydrogen-low",
+            "carbon": "api:gemini/gemini-4-carbon@high",
+            "gemini 4 carbon medium": "api:gemini/gemini-4-carbon@medium",
             "gemini pro high": "agy:gemini-4-argon-high",
             "argon 4 low": "agy:gemini-4-argon-low",
             "opus via agy": "agy:claude-opus-5-5-high",
@@ -44,7 +50,9 @@ class Naming(unittest.TestCase):
 
     def test_specs_and_aliases_still_work(self):
         self.assertEqual(self.spec("codex:gpt-6.1-sol@low"), "codex:gpt-6.1-sol@low")
-        self.assertEqual(self.spec("google-fast"), "agy:gemini-3.8-flash-medium")
+        self.assertEqual(self.spec("google-fast"), "agy:gemini-4-hydrogen-medium")
+        self.assertEqual(self.spec("google-cheap"), "agy:gemini-3.8-flash-medium")
+        self.assertEqual(self.spec("google-frontier"), "api:gemini/gemini-4-carbon@high")
 
     def test_unknown_effort_refused(self):
         with self.assertRaises(crew.CrewError) as e:
@@ -117,6 +125,28 @@ class SkillTable(unittest.TestCase):
                     self.assertEqual(sorted(listed), sorted(efforts), key)
 
 
+class AgyQuota(unittest.TestCase):
+    def test_agy_limits_are_per_model(self):
+        key = lambda ref: crew.quota_key(crew.expand_agent(CFG, ref)[0])  # noqa: E731
+        self.assertEqual(key("hydrogen@low"), "agy:gemini-4-hydrogen")
+        self.assertEqual(key("hydrogen@xhigh"), "agy:gemini-4-hydrogen")
+        self.assertEqual(key("google-cheap"), "agy:gemini-3.8-flash")
+        self.assertEqual(key("argon"), "agy:gemini-4-argon")
+        self.assertEqual(key("gpt-oss"), "agy:gpt-oss-120b")
+        self.assertEqual(key("codex"), "codex")
+        self.assertEqual(key("carbon"), "gemini")
+
+    def test_research_falls_back_to_flash_when_hydrogen_is_limited(self):
+        research = CFG["roles"]["research"]["agent"]
+        quota = {"agy:gemini-4-hydrogen": {"limited_until": 4102444800}}
+        saved, crew.backend_cmd = crew.backend_cmd, (lambda c, b: [b])
+        try:
+            spec, _, _ = crew.choose_agent(CFG, research, caller="claude", quota=quota)
+        finally:
+            crew.backend_cmd = saved
+        self.assertEqual(crew.spec_str(spec), "agy:gemini-3.8-flash-medium")
+
+
 class ModelsCommand(unittest.TestCase):
     def test_offline_list(self):
         r = subprocess.run([sys.executable, str(CREW), "models", "--offline"], capture_output=True, text=True,
@@ -131,8 +161,9 @@ class ModelsCommand(unittest.TestCase):
         import io
         import types
         offered = [{"slug": s, "description": ""} for s in
-                   ("gemini-3.8-flash-medium", "gemini-4-argon", "gpt-oss-120b-medium")]
-        saved = crew.backend_cmd, crew.agy_models, crew.codex_models, crew.load_config
+                   ("gemini-3.8-flash-medium", "gemini-4-hydrogen-medium", "gemini-4-argon", "gpt-oss-120b-medium")]
+        saved = crew.backend_cmd, crew.agy_models, crew.codex_models, crew.load_config, crew.opencode_models
+        crew.opencode_models = lambda cfg: None
         crew.backend_cmd = lambda cfg, b: [b] if b == "agy" else None
         crew.agy_models = lambda cfg: offered
         crew.codex_models = lambda: None
@@ -142,11 +173,13 @@ class ModelsCommand(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 crew.cmd_models(types.SimpleNamespace(offline=False))
         finally:
-            crew.backend_cmd, crew.agy_models, crew.codex_models, crew.load_config = saved
+            crew.backend_cmd, crew.agy_models, crew.codex_models, crew.load_config, crew.opencode_models = saved
         text = out.getvalue()
         self.assertIn("argon (gemini-4-argon-{effort}) is not offered by your agy; it offers gemini-4-argon", text)
         self.assertIn("agy-opus (claude-opus-5-5-{effort}) is not offered", text)
         self.assertNotIn("gemini-flash (", text)
+        self.assertNotIn("hydrogen (", text)
+        self.assertNotIn("carbon (", text)  # api models are not checked against agy
 
 
 if __name__ == "__main__":
