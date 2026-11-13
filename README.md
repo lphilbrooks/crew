@@ -33,7 +33,7 @@ Turn your coding agent into a team lead that can hand work to agents from other 
 | Review a diff (uncommitted, a commit, or a branch) | `review` | Codex gpt-6.1-sol, which can build and run tests |
 | Second opinion on a plan, claim or finding | `check` | Codex gpt-6.1-sol |
 | Bounded implementation; it edits files but never commits | `build` (or `implement`) | Codex gpt-6.1-sol |
-| Boilerplate, fixtures, scaffolding | `build-light` (or `implement-light`) | Codex gpt-6-luna |
+| Boilerplate, fixtures, scaffolding | `build-light` (or `implement-light`) | Claude Haiku 5.5, then Codex gpt-6.1-terra |
 | Web research and version lookups, with sources | `research` | Gemini 4 Hydrogen, with Google Search built in |
 | Summaries of files or logs, drafting text | `light` | Gemini 4 Hydrogen |
 
@@ -339,9 +339,11 @@ you (or your agent) can name one without knowing each CLI's model ids:
 | `carbon` | api | high, low, medium | Gemini 4 Carbon, Google's strongest: Gemini API only (paid `GEMINI_API_KEY`), read-only, no tools |
 | `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
 | `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
-| `sol` | codex | high, low, medium, xhigh, max | reviews and harder builds |
-| `astra` | codex | high, low, medium, xhigh, max | frontier reasoning, slower and dearer |
-| `luna` | codex | medium, none, low, high, xhigh, max | fast, cheap builds and lookups |
+| `sol` | codex | high, low, medium, xhigh, max, ultra | GPT-6.1 Sol: reviews and harder builds |
+| `astra` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Astra: frontier reasoning, slower and dearer |
+| `terra` | codex | medium, low, high, xhigh, max, ultra | GPT-6.1 Terra, the mid tier: about 3x faster than Sol; light builds |
+| `luna` | codex | medium, low, high, xhigh, max | GPT-6 Luna: fastest, cheapest; lookups and summaries |
+| `sol-6`, `sol-5.6`, `terra-5.6`, `luna-5.6` | codex | as above | older generations |
 | `opus`, `sonnet`, `fable` | claude | high, low, medium, xhigh, max | Claude models |
 | `haiku` | claude | medium, low, high, xhigh, max | cheap Claude research and summaries |
 
@@ -359,7 +361,7 @@ lack. Add your own under `"models"` in `~/.crew/config.json`; anything else stil
 | review | Codex gpt-6.1-sol (high), Claude Opus, Gemini 4 Argon (high) | verify |
 | check | same | verify |
 | build (implement) | Codex gpt-6.1-sol (medium), Claude Sonnet, Gemini 4 Hydrogen | write |
-| build-light (implement-light) | Claude Haiku 5.5, Codex gpt-6-luna, Gemini 4 Hydrogen | write |
+| build-light (implement-light) | Claude Haiku 5.5, Codex gpt-6.1-terra, Gemini 4 Hydrogen | write |
 | research | Gemini 4 Hydrogen (medium), then Gemini 3.8 Flash, then Claude Haiku 5.5, then Codex gpt-6-luna | read + web |
 | light | Claude Haiku 5.5, then Gemini 4 Hydrogen, then Codex gpt-6-luna | read |
 
@@ -457,6 +459,17 @@ macOS, and checks the skill against the
 [Agent Skills specification](https://agentskills.io/specification).
 
 ## Changes
+
+**1.7.0**
+- Codex's current models are all listed: GPT-6.1 Terra (`terra`, the mid tier released in October)
+  and the older `sol-6`, `sol-5.6`, `terra-5.6` and `luna-5.6`. New alias `codex-light` is Terra at
+  medium effort.
+- `build-light` now uses Terra instead of Luna as its Codex choice: it is about three times faster
+  than Sol and writes code more reliably than Luna. Luna stays the Codex choice for `research` and
+  `light`.
+- Sol, Astra and Terra take the new `ultra` effort (Codex delegates parts of the task to its own
+  sub-agents). Luna no longer takes `none`, which Codex dropped.
+- The Dellmine-only 1.3.1 change (`google-balanced` = Gemini 4 Argon at medium) is merged.
 
 **1.6.0** (merges two lines of work that both started from 1.3)
 - Gemini 4 Hydrogen (agy, low/medium/high/xhigh) is the default Google model: research tries it first,

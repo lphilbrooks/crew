@@ -385,6 +385,8 @@ class TestPreambleAndDefaults(unittest.TestCase):
         self.assertEqual(cfg["agents"]["claude-fast"], "claude:claude-haiku-5-5@medium")
         for role in ("implement-light", "light"):
             self.assertEqual(cfg["roles"][role]["agent"][0], "claude-fast", role)
+        # Light builds go to GPT-6.1 Terra (Codex's mid tier) rather than Luna.
+        self.assertEqual(cfg["roles"]["implement-light"]["agent"][1], "codex-light")
         # Research goes to Gemini 4 Hydrogen first, for speed and its built-in Google Search; 3.8 Flash
         # is the cheaper Google fallback when Hydrogen is limited.
         self.assertEqual(cfg["roles"]["research"]["agent"][:3], ["google-fast", "google-cheap", "claude-fast"])

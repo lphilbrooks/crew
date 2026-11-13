@@ -40,7 +40,13 @@ class Naming(unittest.TestCase):
             "opus via agy": "agy:claude-opus-5-5-high",
             "gpt-oss": "agy:gpt-oss-120b-medium",
             "codex": "codex:gpt-6.1-sol@high",
-            "luna@none": "codex:gpt-6-luna@none",
+            "luna": "codex:gpt-6-luna@medium",
+            "terra": "codex:gpt-6.1-terra@medium",
+            "codex terra high": "codex:gpt-6.1-terra@high",
+            "sol@ultra": "codex:gpt-6.1-sol@ultra",
+            "gpt-6-sol": "codex:gpt-6-sol@high",
+            "gpt-5.6-terra": "codex:gpt-5.6-terra@medium",
+            "codex-light": "codex:gpt-6.1-terra@medium",
             "sol xhigh": "codex:gpt-6.1-sol@xhigh",
             "claude opus": "claude:claude-opus-5-5@high",
             "haiku": "claude:claude-haiku-5-5@medium",
@@ -60,13 +66,17 @@ class Naming(unittest.TestCase):
         self.assertIn("low | medium | high", str(e.exception))
         with self.assertRaises(crew.CrewError):
             crew.expand_agent(CFG, "sol@none")
+        with self.assertRaises(crew.CrewError):
+            crew.expand_agent(CFG, "luna@ultra")  # Codex offers ultra only on Sol, Astra and Terra
+        with self.assertRaises(crew.CrewError):
+            crew.expand_agent(CFG, "luna@none")  # Codex no longer offers none
         with self.assertRaises(crew.CrewError) as e:
             crew.expand_agent(CFG, "gemini flash xhigh")
         self.assertIn("not 'xhigh'", str(e.exception))
 
     def test_unknown_name_points_to_models(self):
         with self.assertRaises(crew.CrewError) as e:
-            crew.expand_agent(CFG, "gemini ultra")
+            crew.expand_agent(CFG, "gemini nebula")
         self.assertIn("crew.py models", str(e.exception))
 
     def test_effort_flag_moves_into_agy_model_id(self):

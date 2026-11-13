@@ -17,7 +17,7 @@ compatibility: >-
   installed and signed in, or an API key for a provider such as OpenRouter, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.6.0"
+  version: "1.7.0"
 ---
 
 # crew
@@ -82,13 +82,19 @@ When the user names a model ("use gemini flash, medium effort"), pass it with `-
 | `carbon` | api | high, low, medium | Gemini 4 Carbon, Google's strongest: Gemini API only (paid `GEMINI_API_KEY`), read-only, no tools |
 | `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
 | `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
-| `sol` | codex | high, low, medium, xhigh, max | reviews and harder builds |
-| `astra` | codex | high, low, medium, xhigh, max | frontier reasoning, slower and dearer |
-| `luna` | codex | medium, none, low, high, xhigh, max | fast, cheap builds and lookups |
+| `sol` | codex | high, low, medium, xhigh, max, ultra | GPT-6.1 Sol: reviews and harder builds |
+| `astra` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Astra: frontier reasoning, slower and dearer |
+| `terra` | codex | medium, low, high, xhigh, max, ultra | GPT-6.1 Terra (Oct 2026), the mid tier: about 3x faster than Sol; light builds |
+| `luna` | codex | medium, low, high, xhigh, max | GPT-6 Luna: fastest, cheapest; lookups and summaries |
+| `sol-6` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Sol, the previous Sol: use when 6.1 is limited |
+| `sol-5.6` | codex | high, low, medium, xhigh, max, ultra | GPT-5.6 Sol, older |
+| `terra-5.6` | codex | medium, low, high, xhigh, max, ultra | GPT-5.6 Terra, older |
+| `luna-5.6` | codex | medium, low, high, xhigh, max | GPT-5.6 Luna, older |
 | `opus`, `sonnet`, `fable` | claude | high, low, medium, xhigh, max | Claude models |
 | `haiku` | claude | medium, low, high, xhigh, max | cheap Claude research and summaries |
 
-An effort the model doesn't take is refused with the list it does take. Any other model id works
+`ultra` lets Codex hand parts of the task to its own sub-agents: slow and costly, so use it only
+when the user asks. An effort the model doesn't take is refused with the list it does take. Any other model id works
 as `backend:model[@effort]`, e.g. `agy:gemini-4-hydrogen-high`. `crew.py models` prints this
 list, other names it understands, and which models the installed CLIs offer or lack.
 
