@@ -29,12 +29,14 @@ Turn your coding agent into a team lead that can hand work to agents from other 
 |---|---|---|
 | Review a diff (uncommitted, a commit, or a branch) | `review` | Codex gpt-6.1-sol, which can build and run tests |
 | Second opinion on a plan, claim or finding | `check` | Codex gpt-6.1-sol |
-| Bounded implementation; it edits files but never commits | `implement` | Codex gpt-6.1-sol |
-| Boilerplate, fixtures, scaffolding | `implement-light` | Codex gpt-6-luna |
-| Web research and version lookups, with sources | `research` | Codex gpt-6-luna, then Gemini Flash |
+| Bounded implementation; it edits files but never commits | `build` (or `implement`) | Codex gpt-6.1-sol |
+| Boilerplate, fixtures, scaffolding | `build-light` (or `implement-light`) | Codex gpt-6-luna |
+| Web research and version lookups, with sources | `research` | Gemini 3.8 Flash, with Google Search built in |
 | Summaries of files or logs, drafting text | `light` | Gemini Flash |
 
 When Codex is in charge, reviews go to Claude Opus and the light roles to Claude Haiku 5.5.
+Any task can go to a model you name instead: *"use crew to research X, use gemini flash medium
+effort"* becomes `--agent gemini-flash@medium`.
 Independent pieces run in parallel, and a finished Codex or Claude task can be continued in the
 same session with `--resume`.
 
@@ -209,7 +211,9 @@ crew.py run --role implement --task-file todo.md --network --wait
 crew.py run --resume <run folder> --task "Use the helper in util.py instead" --wait
 crew.py run --role research --task "Latest stable <library> version, with sources" --wait
 crew.py run --role research --panel --task "..." --wait     # same question to two model families
+crew.py run --role build --agent luna@high --task-file todo.md --wait   # build with a named model
 crew.py check <run folder>                                  # re-run the fact check
+crew.py stop <run folder>                                   # stop a running task or panel
 crew.py prune --dry-run                                     # build output older runs still hold
 crew.py status | stats | quota | collect <run folder> | roles | models | doctor
 ```
@@ -221,9 +225,11 @@ Useful flags:
 | `--access read\|verify\|write` | file access for this task |
 | `--web` / `--no-web` | allow or block web search |
 | `--network` / `--no-network` | allow or block network for commands |
-| `--agent <spec>` | use a specific agent, e.g. `codex:gpt-6.1-sol@high` |
+| `--agent <model>` | use a named model, e.g. `gemini-flash@medium`, `sol@high`, or a spec like `codex:gpt-6.1-sol@high` |
+| `--effort` | set the reasoning effort; refused if the model doesn't take it |
 | `--caller codex\|claude\|agy` | say who's calling, so crew skips that model family |
 | `--panel [N]` | send the task to N agents (default 2) from different model families, to compare |
+| `--brief` | with `--wait` or `collect`, print only the first 40 lines of the answer and its path |
 
 ## How strictly scopes are enforced
 
@@ -243,26 +249,51 @@ afterwards. Details: [`permissions.md`](skills/crew/references/permissions.md).
 Models live in config, not code.
 - The defaults are in [`assets/config.default.json`](skills/crew/assets/config.default.json).
 - Your overrides go in `~/.crew/config.json`.
-- An agent is written `backend:model@effort`, e.g. `codex:gpt-6.1-sol@high`,
-  `claude:claude-opus-5-5@high`, `agy:gemini-3.8-flash-medium`.
+
+**Naming a model.** crew keeps a list of models by name, each with the efforts it takes, so
+you (or your agent) can name one without knowing each CLI's model ids:
+
+| Name | CLI | Efforts (default first) | Good for |
+|---|---|---|---|
+| `gemini-flash` | agy | medium, low, high | cheap research with Google Search |
+| `argon` | agy | medium, low, high | Gemini 4 Argon (replaced Gemini Pro): hard reasoning and builds; its own weekly quota |
+| `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
+| `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
+| `sol` | codex | high, low, medium, xhigh, max | reviews and harder builds |
+| `astra` | codex | high, low, medium, xhigh, max | frontier reasoning, slower and dearer |
+| `luna` | codex | medium, none, low, high, xhigh, max | fast, cheap builds and lookups |
+| `opus`, `sonnet`, `fable` | claude | high, low, medium, xhigh, max | Claude models |
+| `haiku` | claude | medium, low, high, xhigh, max | cheap Claude research and summaries |
+
+Write `--agent gemini-flash@medium`, or `--agent "gemini flash" --effort medium`; plain names
+such as `flash`, `codex` or `opus via agy` work too. An effort a model doesn't take is refused.
+For agy, crew puts the effort into the model id (`gemini-3.8-flash-medium`). `crew.py models`
+prints the list, the other names it understands, and which models your installed CLIs offer or
+lack. Add your own under `"models"` in `~/.crew/config.json`; anything else still works as
+`backend:model@effort`, e.g. `agy:gemini-3.8-flash-high`.
+
+**Roles.** Each role tries agents in order:
 
 | Role | Tries, in order | Default scope |
 |---|---|---|
 | review | Codex gpt-6.1-sol (high), Claude Opus | verify |
 | check | same | verify |
-| implement | Codex gpt-6.1-sol (medium), Claude Sonnet | write |
-| implement-light | Claude Haiku 5.5, Codex gpt-6-luna | write |
-| research | Claude Haiku 5.5, then Codex gpt-6-luna, then Gemini Flash | read + web |
+| build (implement) | Codex gpt-6.1-sol (medium), Claude Sonnet | write |
+| build-light (implement-light) | Claude Haiku 5.5, Codex gpt-6-luna | write |
+| research | Gemini 3.8 Flash (medium), then Claude Haiku 5.5, then Codex gpt-6-luna | read + web |
 | light | Claude Haiku 5.5, then Gemini Flash, then Codex gpt-6-luna | read |
 
 crew skips the caller's own model family, so from Claude Code the last three roles go to Codex or
-Gemini, and Haiku 5.5 runs them when Codex or agy is in charge. Claude agents use full model ids
+Gemini, and Haiku 5.5 runs the light ones when Codex or agy is in charge. `review` and `check` are marked
+`"other_family": true`: if the only installed candidates are from the caller's own family, they
+refuse to run rather than give a second opinion from the same family. Name an agent with `--agent`
+to run one anyway. Other roles fall back to the caller's family and say so in the result. Claude agents use full model ids
 (`claude:claude-haiku-5-5`) because Claude Code's aliases can lag a release.
 
 Change them from the command line:
 
 ```sh
-crew.py models                                          # what's available
+crew.py models                                          # models by name, and what your CLIs offer
 crew.py set-agent codex-strong codex:gpt-6-astra@high   # change what an alias points to
 crew.py set-role review --agent claude-strong codex-strong
 crew.py roles --caller codex                            # check what each role will use
@@ -306,7 +337,8 @@ or when you want a per-task permission scope and a readable record of every prom
 | a role says `NOT INSTALLED` | install that CLI, or set `backends.<name>.exe` |
 | agy research returns `permission-denied` | run `crew.py setup-agy-web` |
 | an agy tab stays blank for minutes | normal: agy prints only when it's done |
-| unexpected `scope-violation` | your own edits during the run count too |
+| unexpected `scope-violation` | your own edits during the run count too. If a crew `write` task in the same repository was still running, collect the run again after it finishes |
+| `review` or `check` refuses to run | only the caller's own model family is installed; install another CLI, or pass `--agent` to accept it |
 | Codex on Windows can't run any command | set up its sandbox. From a remote or service session (Windows session 0) it can't work at all; `doctor` warns about this |
 | no tab opens | run `crew.py doctor`, or use `--view hidden` |
 | status `limited` | the vendor's usage limit was hit; `note` says whether the task moved to another agent. `crew.py quota` shows when limits reset |
@@ -326,6 +358,28 @@ macOS, and checks the skill against the
 [Agent Skills specification](https://agentskills.io/specification).
 
 ## Changes
+
+**1.5.0**
+- Models by name: `--agent gemini-flash@medium`, `--agent "gemini flash" --effort medium`, `sol`,
+  `luna`, `opus via agy` and so on. Each model lists the efforts it takes, and others are refused.
+  The list covers the models the three CLIs offer: Codex Sol, Astra and Luna; Claude Opus,
+  Sonnet, Haiku and Fable; and through agy, Gemini 3.8 Flash, Gemini 4 Argon, Claude and gpt-oss.
+- `crew.py models` prints the list and checks it against the installed CLIs.
+- `build` and `build-light` name the `implement` roles.
+- Research goes to Gemini 3.8 Flash first.
+
+**1.4.0**
+- `review` and `check` refuse to run on the caller's own model family unless `--agent` names the
+  agent, and `--wait` prints a warning when any other role falls back to it.
+- Reviews whose diff is pasted into the prompt leave out untracked files whose names suggest
+  secrets (`.env`, keys, credentials) and untracked files over 100 KB.
+- Claude reviews with `verify` access read the diff with git instead of having it pasted in, so
+  large diffs no longer fail.
+- A `read` or `verify` run no longer reports a concurrent crew `write` run's changes in the same
+  repository as violations; they are listed under `concurrent_changes`.
+- `crew.py stop` stops a running task or panel and records it as `cancelled`.
+- `--brief` prints only the start of each answer and the path to the rest.
+- Timeouts stop the agent as soon as it exits instead of always waiting 5 seconds.
 
 **1.3.0**
 - Build output is removed from a run's scratch folder when it finishes. Before this, every Rust

@@ -34,6 +34,12 @@ of every dirty or untracked file.
 Gitignored files aren't seen, so ignored build output is always allowed. Outside git nothing is
 checked. Your own edits during a run are indistinguishable from the agent's.
 
+Crew `write` runs in the same repository whose time overlaps a `read` or `verify` run are taken
+into account: files a finished one lists in `touched_files` go to `concurrent_changes`, not
+`violations`. If one is still running when the read run ends, the violation stands for now and
+`crew.py collect` checks again. A `write` run that overlapped another says so in `note`, because
+its `touched_files` can then include the other run's changes.
+
 ## Scratch folder
 
 Each task gets `<run folder>/scratch`, exported as `CREW_SCRATCH`.

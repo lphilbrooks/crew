@@ -16,10 +16,14 @@ anything.
 | `timeout` | Look at what it changed, then split the task or allow more time. |
 | `harness-error` | crew's runner failed or its window was closed. Rerun. |
 | `limited` | The vendor's usage limit was hit. If `note` says it was retried, use the linked run; otherwise wait or pick another agent. |
+| `cancelled` | You stopped it with `crew.py stop`. Look at what it changed before sending a corrected task. |
 
 **Scope violations.** `violations` lists repository files that changed during a `read` or
 `verify` task. Your own edits during the run are included, so remove those from the list first.
-Then check each remaining file and revert only those. Never reset the whole tree.
+Files reported by a crew `write` run that ran at the same time in the same repository are moved to
+`concurrent_changes` instead. If `note` says such a run is still running, collect this run again
+after it finishes. Then check each remaining file and revert only those. Never reset the whole
+tree.
 
 ## After an implement task
 

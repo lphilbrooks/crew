@@ -17,6 +17,9 @@ if kind in os.environ.get("FAKE_LIMITED", "").split(","):
 if "--version" in args:
     print(f"fake-{kind} 1.0.0")
     sys.exit(0)
+if "--help" in args:
+    print(f"usage: fake-{kind} [options]")
+    sys.exit(0)
 
 if mode == "sleep":
     time.sleep(600)

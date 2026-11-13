@@ -52,8 +52,8 @@ this task.
   the error and name the file.
 - **Several jobs in one task.** Split them, and run them in parallel if they're independent.
 - **Parallel writes to the same files.** Give each `write` task its own files, and say which.
-- **A wrong assumption.** You can't talk to the agent mid-run. Stop it, look at what it changed,
-  and send a corrected task.
+- **A wrong assumption.** You can't talk to the agent mid-run. Stop it with
+  `crew.py stop <run folder>`, look at what it changed, and send a corrected task.
 - **Unwanted exploring.** For pure reasoning, say "answer from the text above; don't read files or
   run commands".
 - **Secrets.** Never include tokens, passwords or personal data. They'd be saved in the run
