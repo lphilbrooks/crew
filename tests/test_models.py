@@ -35,21 +35,32 @@ class Naming(unittest.TestCase):
             "gemini hydrogen low": "agy:gemini-4-hydrogen-low",
             "carbon": "api:gemini/gemini-4-carbon@high",
             "gemini 4 carbon medium": "api:gemini/gemini-4-carbon@medium",
+            "carbon via agy": "agy:gemini-4-carbon-high",
+            "neon": "agy:gemini-4-neon-high",
+            "gemini neon xhigh": "agy:gemini-4-neon-xhigh",
+            "neon@low": "agy:gemini-4-neon-low",
             "gemini pro high": "agy:gemini-4-argon-high",
             "argon 4 low": "agy:gemini-4-argon-low",
             "opus via agy": "agy:claude-opus-5-5-high",
             "gpt-oss": "agy:gpt-oss-120b-medium",
-            "codex": "codex:gpt-6.1-sol@high",
+            "codex": "codex:gpt-6.2-sol@high",
             "luna": "codex:gpt-6-luna@medium",
             "terra": "codex:gpt-6.1-terra@medium",
             "codex terra high": "codex:gpt-6.1-terra@high",
-            "sol@ultra": "codex:gpt-6.1-sol@ultra",
+            "sol@ultra": "codex:gpt-6.2-sol@ultra",
+            "astra": "codex:gpt-6.2-astra@high",
+            "gpt-6.1-sol": "codex:gpt-6.1-sol@high",
+            "sol-6.1@low": "codex:gpt-6.1-sol@low",
+            "gpt-6-astra": "codex:gpt-6-astra@high",
             "gpt-6-sol": "codex:gpt-6-sol@high",
             "gpt-5.6-terra": "codex:gpt-5.6-terra@medium",
             "codex-light": "codex:gpt-6.1-terra@medium",
-            "sol xhigh": "codex:gpt-6.1-sol@xhigh",
+            "sol xhigh": "codex:gpt-6.2-sol@xhigh",
             "claude opus": "claude:claude-opus-5-5@high",
             "haiku": "claude:claude-haiku-5-5@medium",
+            "fable": "claude:claude-fable-5-2@high",
+            "claude fable medium": "claude:claude-fable-5-2@medium",
+            "claude-fable-5-1": "claude:claude-fable-5-1@high",
         }
         for ref, want in cases.items():
             self.assertEqual(self.spec(ref), want, ref)
@@ -59,6 +70,8 @@ class Naming(unittest.TestCase):
         self.assertEqual(self.spec("google-fast"), "agy:gemini-4-hydrogen-medium")
         self.assertEqual(self.spec("google-cheap"), "agy:gemini-3.8-flash-medium")
         self.assertEqual(self.spec("google-frontier"), "api:gemini/gemini-4-carbon@high")
+        self.assertEqual(self.spec("google-neon"), "agy:gemini-4-neon-high")
+        self.assertEqual(self.spec("claude-frontier"), "claude:claude-fable-5-2@high")
 
     def test_unknown_effort_refused(self):
         with self.assertRaises(crew.CrewError) as e:
@@ -189,7 +202,8 @@ class ModelsCommand(unittest.TestCase):
         self.assertIn("agy-opus (claude-opus-5-5-{effort}) is not offered", text)
         self.assertNotIn("gemini-flash (", text)
         self.assertNotIn("hydrogen (", text)
-        self.assertNotIn("carbon (", text)  # api models are not checked against agy
+        self.assertNotIn("  agy: carbon (", text)  # api models are not checked against agy
+        self.assertIn("agy-carbon (gemini-4-carbon-{effort}) is not offered", text)
 
 
 if __name__ == "__main__":

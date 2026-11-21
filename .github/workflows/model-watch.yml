@@ -1,0 +1,56 @@
+name: model-watch
+
+# Checks once a day whether Codex, Antigravity, Anthropic or Google have models that crew's
+# built-in list doesn't know about, and keeps one open issue with the report. Scheduled runs
+# only happen on the default branch; run it by hand from the Actions tab at any time.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Compare crew's model list with the vendors' lists
+        id: watch
+        run: |
+          set +e
+          python tools/model_watch.py > report.md
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Open or update the model-watch issue
+        if: steps.watch.outputs.code == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Model watch: crew's model list needs updating"
+          {
+            cat report.md
+            echo
+            echo "Update skills/crew/assets/config.default.json, SKILL.md, README.md and tests/test_models.py,"
+            echo "or add deliberate omissions to tools/model_watch_ignore.json. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > body.md
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$n" ]; then gh issue edit "$n" --body-file body.md; else gh issue create --title "$title" --body-file body.md; fi
+      - name: Close the issue when crew is up to date
+        if: steps.watch.outputs.code == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Model watch: crew's model list needs updating"
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$n" ]; then gh issue close "$n" --comment "crew's model list matches the vendors' lists again."; fi
+      - name: Fail when a source could not be read
+        if: steps.watch.outputs.code == '2'
+        run: |
+          echo "::error::model_watch could not read one of its sources; see the summary"
+          exit 1

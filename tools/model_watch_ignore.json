@@ -1,0 +1,7 @@
+{
+  "_doc": "Model ids tools/model_watch.py should stop reporting, because crew leaves them out on purpose.",
+  "codex": ["gpt-5.5"],
+  "agy": ["claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro", "gemini-3.6-flash", "gemini-3.7-flash"],
+  "claude": [],
+  "gemini": []
+}

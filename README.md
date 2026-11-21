@@ -30,9 +30,9 @@ Turn your coding agent into a team lead that can hand work to agents from other 
 
 | Job | Role | Goes to, when Claude Code is in charge |
 |---|---|---|
-| Review a diff (uncommitted, a commit, or a branch) | `review` | Codex gpt-6.1-sol, which can build and run tests |
-| Second opinion on a plan, claim or finding | `check` | Codex gpt-6.1-sol |
-| Bounded implementation; it edits files but never commits | `build` (or `implement`) | Codex gpt-6.1-sol |
+| Review a diff (uncommitted, a commit, or a branch) | `review` | Codex gpt-6.2-sol, which can build and run tests |
+| Second opinion on a plan, claim or finding | `check` | Codex gpt-6.2-sol |
+| Bounded implementation; it edits files but never commits | `build` (or `implement`) | Codex gpt-6.2-sol |
 | Boilerplate, fixtures, scaffolding | `build-light` (or `implement-light`) | Claude Haiku 5.5, then Codex gpt-6.1-terra |
 | Web research and version lookups, with sources | `research` | Gemini 4 Hydrogen, with Google Search built in |
 | Summaries of files or logs, drafting text | `light` | Gemini 4 Hydrogen |
@@ -294,7 +294,7 @@ Useful flags:
 | `--access read\|verify\|write` | file access for this task |
 | `--web` / `--no-web` | allow or block web search |
 | `--network` / `--no-network` | allow or block network for commands |
-| `--agent <model>` | use a named model, e.g. `gemini-flash@medium`, `sol@high`, or a spec like `codex:gpt-6.1-sol@high` or `opencode:openrouter/<model>` |
+| `--agent <model>` | use a named model, e.g. `gemini-flash@medium`, `sol@high`, or a spec like `codex:gpt-6.2-sol@high` or `opencode:openrouter/<model>` |
 | `--effort` | set the reasoning effort; refused if the model doesn't take it |
 | `--caller codex\|claude\|agy\|opencode:<model>` | say who's calling, so crew skips that model family |
 | `--panel [N]` | send the task to N agents (default 2) from different model families, to compare |
@@ -321,7 +321,7 @@ afterwards. Details: [`permissions.md`](skills/crew/references/permissions.md).
 Models live in config, not code.
 - The defaults are in [`assets/config.default.json`](skills/crew/assets/config.default.json).
 - Your overrides go in `~/.crew/config.json`.
-- An agent is written `backend[+provider]:model@effort`, e.g. `codex:gpt-6.1-sol@high`,
+- An agent is written `backend[+provider]:model@effort`, e.g. `codex:gpt-6.2-sol@high`,
   `claude:claude-opus-5-5@high`, `agy:gemini-3.8-flash-medium`, `opencode:openrouter/<model>`,
   `api:groq/<model>` or `claude+openrouter:<model>`.
 - The defaults use only Codex, Claude and agy. Add others to a role with `set-agent` and
@@ -335,16 +335,18 @@ you (or your agent) can name one without knowing each CLI's model ids:
 |---|---|---|---|
 | `hydrogen` | agy | medium, low, high, xhigh | Gemini 4 Hydrogen (Nov 2026, succeeds 3.8 Flash): fast research with Google Search, light builds |
 | `gemini-flash` | agy | medium, low, high | Gemini 3.8 Flash: cheapest; fallback when Hydrogen is limited |
+| `neon` | agy | high, low, medium, xhigh | Gemini 4 Neon (Nov 2026), between Hydrogen and Carbon: hard reasoning and reviews; paid Pro and Ultra |
 | `argon` | agy | medium, low, high | Gemini 4 Argon (replaced Gemini Pro): hard reasoning and reviews; its own weekly quota |
-| `carbon` | api | high, low, medium | Gemini 4 Carbon, Google's strongest: Gemini API only (paid `GEMINI_API_KEY`), read-only, no tools |
+| `carbon` | api | high, low, medium | Gemini 4 Carbon, Google's strongest: Gemini API (paid `GEMINI_API_KEY`), read-only, no tools |
+| `agy-carbon` | agy | high, low, medium | Gemini 4 Carbon through agy: Google AI Ultra and Enterprise plans only |
 | `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
-| `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
-| `sol` | codex | high, low, medium, xhigh, max, ultra | GPT-6.1 Sol: reviews and harder builds |
-| `astra` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Astra: frontier reasoning, slower and dearer |
+| `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model; agy removes it on 30 Nov 2026 |
+| `sol` | codex | high, low, medium, xhigh, max, ultra | GPT-6.2 Sol (Nov 2026): reviews and harder builds |
+| `astra` | codex | high, low, medium, xhigh, max, ultra | GPT-6.2 Astra (Nov 2026): frontier reasoning, slower and dearer |
 | `terra` | codex | medium, low, high, xhigh, max, ultra | GPT-6.1 Terra, the mid tier: about 3x faster than Sol; light builds |
 | `luna` | codex | medium, low, high, xhigh, max | GPT-6 Luna: fastest, cheapest; lookups and summaries |
-| `sol-6`, `sol-5.6`, `terra-5.6`, `luna-5.6` | codex | as above | older generations |
-| `opus`, `sonnet`, `fable` | claude | high, low, medium, xhigh, max | Claude models |
+| `sol-6.1`, `astra-6`, `sol-6`, `sol-5.6`, `terra-5.6`, `luna-5.6` | codex | as above | older generations |
+| `opus`, `sonnet`, `fable`, `fable-5.1` | claude | high, low, medium, xhigh, max | Claude models; `fable` is Fable 5.2 (Nov 2026), `fable-5.1` the previous one |
 | `haiku` | claude | medium, low, high, xhigh, max | cheap Claude research and summaries |
 
 Write `--agent gemini-flash@medium`, or `--agent "gemini flash" --effort medium`; plain names
@@ -358,9 +360,9 @@ lack. Add your own under `"models"` in `~/.crew/config.json`; anything else stil
 
 | Role | Tries, in order | Default scope |
 |---|---|---|
-| review | Codex gpt-6.1-sol (high), Claude Opus, Gemini 4 Argon (high) | verify |
+| review | Codex gpt-6.2-sol (high), Claude Opus, Gemini 4 Argon (high) | verify |
 | check | same | verify |
-| build (implement) | Codex gpt-6.1-sol (medium), Claude Sonnet, Gemini 4 Hydrogen | write |
+| build (implement) | Codex gpt-6.2-sol (medium), Claude Sonnet, Gemini 4 Hydrogen | write |
 | build-light (implement-light) | Claude Haiku 5.5, Codex gpt-6.1-terra, Gemini 4 Hydrogen | write |
 | research | Gemini 4 Hydrogen (medium), then Gemini 3.8 Flash, then Claude Haiku 5.5, then Codex gpt-6-luna | read + web |
 | light | Claude Haiku 5.5, then Gemini 4 Hydrogen, then Codex gpt-6-luna | read |
@@ -376,7 +378,7 @@ Change them from the command line:
 
 ```sh
 crew.py models                                          # models by name, and what your CLIs offer
-crew.py set-agent codex-strong codex:gpt-6-astra@high   # change what an alias points to
+crew.py set-agent codex-strong codex:gpt-6.2-astra@high   # change what an alias points to
 crew.py set-role review --agent claude-strong codex-strong
 crew.py set-agent cheap-research opencode:openrouter/<model> claude-fast
 crew.py set-role research --agent cheap-research codex-fast google-fast
@@ -458,7 +460,31 @@ The tests use stand-in agents and a stand-in API server, so they need no account
 macOS, and checks the skill against the
 [Agent Skills specification](https://agentskills.io/specification).
 
+## Keeping the model list current
+
+`python tools/model_watch.py` compares the built-in model list with public sources that need no
+account: Codex's bundled model list in the openai/codex repository (ids and efforts),
+Antigravity's [models page](https://antigravity.google/docs/models) (names and removal dates),
+and [models.dev](https://models.dev) (new Anthropic and Google models). It changes nothing and
+prints what to look at. The `model-watch` workflow runs it daily on the default branch and keeps
+one issue open with the report, closing it once the list is current. Models left out on purpose
+go in `tools/model_watch_ignore.json`. On your own machine, `crew.py models --changes` reports
+what your installed CLIs added or dropped since the last check.
+
 ## Changes
+
+**1.8.0** (models as of 21 Nov 2026)
+- Codex: `sol` is now GPT-6.2 Sol and `astra` GPT-6.2 Astra (both 17 Nov 2026). `codex-strong`,
+  `codex-balanced` and `codex-frontier` follow them, so `review`, `check` and `build` use 6.2 Sol.
+  The previous models stay available as `sol-6.1` and `astra-6`.
+- Claude: `fable` (and `claude-frontier`) is now Fable 5.2 (9 Nov 2026); `fable-5.1` keeps the old one.
+- Gemini 4 Neon (`neon`, alias `google-neon`; agy, low/medium/high/xhigh, 18 Nov 2026) sits between
+  Hydrogen and Carbon. Role defaults are unchanged: Argon is still `google-strong`.
+- Gemini 4 Carbon is now in agy for Google AI Ultra and Enterprise plans (`agy-carbon`); `carbon`
+  still uses the Gemini API.
+- `gpt-oss` is marked for removal: agy drops it on 30 Nov 2026.
+- New `tools/model_watch.py` and a daily `model-watch` workflow report models that Codex,
+  Antigravity, Anthropic or Google offer and crew doesn't list yet (see "Keeping the model list current").
 
 **1.7.0**
 - Codex's current models are all listed: GPT-6.1 Terra (`terra`, the mid tier released in October)

@@ -17,7 +17,7 @@ compatibility: >-
   installed and signed in, or an API key for a provider such as OpenRouter, with network access. Runs on Windows, macOS and Linux. Callable from Claude Code,
   Codex or any agent that loads SKILL.md skills and can run shell commands.
 metadata:
-  version: "1.7.0"
+  version: "1.8.0"
 ---
 
 # crew
@@ -78,19 +78,23 @@ When the user names a model ("use gemini flash, medium effort"), pass it with `-
 |---|---|---|---|
 | `hydrogen` | agy | medium, low, high, xhigh | Gemini 4 Hydrogen (Nov 2026, succeeds 3.8 Flash): fast research with Google Search, light builds |
 | `gemini-flash` | agy | medium, low, high | Gemini 3.8 Flash: cheapest; fallback when Hydrogen is limited |
+| `neon` | agy | high, low, medium, xhigh | Gemini 4 Neon (Nov 2026), between Hydrogen and Carbon: hard reasoning and reviews; paid Pro and Ultra |
 | `argon` | agy | medium, low, high | Gemini 4 Argon (replaced Gemini Pro): hard reasoning and reviews; its own weekly quota |
-| `carbon` | api | high, low, medium | Gemini 4 Carbon, Google's strongest: Gemini API only (paid `GEMINI_API_KEY`), read-only, no tools |
+| `carbon` | api | high, low, medium | Gemini 4 Carbon, Google's strongest: Gemini API (paid `GEMINI_API_KEY`), read-only, no tools |
+| `agy-carbon` | agy | high, low, medium | Gemini 4 Carbon through agy: Google AI Ultra and Enterprise plans only |
 | `agy-opus`, `agy-sonnet` | agy | high, low, medium | Claude through agy: saves the Claude plan, but it is still Claude |
-| `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model |
-| `sol` | codex | high, low, medium, xhigh, max, ultra | GPT-6.1 Sol: reviews and harder builds |
-| `astra` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Astra: frontier reasoning, slower and dearer |
+| `gpt-oss` | agy | (one setting) | OpenAI's open-weight 120B model; agy removes it on 30 Nov 2026 |
+| `sol` | codex | high, low, medium, xhigh, max, ultra | GPT-6.2 Sol (Nov 2026): reviews and harder builds |
+| `astra` | codex | high, low, medium, xhigh, max, ultra | GPT-6.2 Astra (Nov 2026): frontier reasoning, slower and dearer |
 | `terra` | codex | medium, low, high, xhigh, max, ultra | GPT-6.1 Terra (Oct 2026), the mid tier: about 3x faster than Sol; light builds |
 | `luna` | codex | medium, low, high, xhigh, max | GPT-6 Luna: fastest, cheapest; lookups and summaries |
-| `sol-6` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Sol, the previous Sol: use when 6.1 is limited |
+| `sol-6.1` | codex | high, low, medium, xhigh, max, ultra | GPT-6.1 Sol, the previous Sol: use when 6.2 is limited |
+| `astra-6` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Astra, the previous Astra |
+| `sol-6` | codex | high, low, medium, xhigh, max, ultra | GPT-6 Sol, older |
 | `sol-5.6` | codex | high, low, medium, xhigh, max, ultra | GPT-5.6 Sol, older |
 | `terra-5.6` | codex | medium, low, high, xhigh, max, ultra | GPT-5.6 Terra, older |
 | `luna-5.6` | codex | medium, low, high, xhigh, max | GPT-5.6 Luna, older |
-| `opus`, `sonnet`, `fable` | claude | high, low, medium, xhigh, max | Claude models |
+| `opus`, `sonnet`, `fable`, `fable-5.1` | claude | high, low, medium, xhigh, max | Claude models; `fable` is Fable 5.2 (Nov 2026), `fable-5.1` the previous one |
 | `haiku` | claude | medium, low, high, xhigh, max | cheap Claude research and summaries |
 
 `ultra` lets Codex hand parts of the task to its own sub-agents: slow and costly, so use it only
@@ -126,7 +130,7 @@ Other options:
 
 | Option | Does |
 |---|---|
-| `--agent <model>` | a model name from the table above, an alias, or `backend[+provider]:model[@effort]`, e.g. `codex:gpt-6.1-sol@high`, `opencode:openrouter/<model>`, `api:openrouter/<model>` or `claude+openrouter:<model>` (always honoured) |
+| `--agent <model>` | a model name from the table above, an alias, or `backend[+provider]:model[@effort]`, e.g. `codex:gpt-6.2-sol@high`, `opencode:openrouter/<model>`, `api:openrouter/<model>` or `claude+openrouter:<model>` (always honoured) |
 | `--effort` | override the reasoning effort |
 | `--model` | override only the model id, keeping the role's CLI |
 | `--view hidden\|tab` | hidden, or in a terminal tab |
